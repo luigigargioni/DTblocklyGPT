@@ -1,0 +1,16 @@
+/**
+ * blocks/index.ts
+ *
+ * Barrel export for the blocks sub-module.
+ * Import from this path for the colour palette and block descriptions.
+ *
+ * Note: importing this barrel does NOT register any Blockly block types.
+ * To register all block types, import `./definitions` (or any file that
+ * transitively imports it) before injecting a Blockly workspace.
+ */
+
+export { blocksColours } from './palette'
+export {
+  blockDescriptionsByType,
+  blockLabelsByType,
+} from './blockTextDictionary'

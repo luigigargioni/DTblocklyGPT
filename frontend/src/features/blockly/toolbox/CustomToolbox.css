@@ -1,0 +1,620 @@
+/* ─── Custom Toolbox Sidebar ──────────────────────────────────────────────── */
+
+/* The clipping window — this is what animates shut. It must NOT be a flex
+   container for the content (see .custom-toolbox__inner below): flexing the
+   header/accordion/pills directly inside a shrinking box forces them to
+   reflow at every intermediate width, wrapping and stacking their own text
+   before disappearing instead of just sliding out of a clipped window. */
+.custom-toolbox {
+  width: 240px;
+  min-width: 240px;
+  max-width: 240px;
+  height: 100%;
+  isolation: isolate;
+  overflow: hidden;
+  box-sizing: border-box;
+  position: relative;
+  /* Same duration/easing as railTransition (MiniDrawerStyled.tsx) — every
+     other collapsible panel in the shell moves on this curve. */
+  transition:
+    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    min-width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.custom-toolbox--collapsed {
+  width: 0;
+  min-width: 0;
+  max-width: 0;
+}
+
+/* The actual content — rigid at 240px regardless of the outer window's
+   current width, so it only ever gets clipped, never resized. */
+.custom-toolbox__inner {
+  width: 240px;
+  min-width: 240px;
+  height: 100%;
+  background-color: #ffffff;
+  border-right: 1px solid #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+.custom-toolbox.is-deleting {
+  border-right-color: #ef4444;
+  box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.26);
+}
+
+.custom-toolbox__header {
+  min-height: 56px;
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+  background-color: #f8fafc;
+}
+
+.custom-toolbox.is-deleting .custom-toolbox__header {
+  border-bottom-color: #fca5a5;
+  background: linear-gradient(180deg, #fff1f2, #ffe7ea);
+}
+
+.custom-toolbox__header-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.custom-toolbox__header-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.custom-toolbox__header-label {
+  color: #475569;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+}
+
+.custom-toolbox__header-subtitle {
+  /* was #94A3B8 (2.56:1 on white, fails AA) — matches theme text.secondary */
+  color: #5a6270;
+  font-size: 0.63rem;
+  line-height: 1.25;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+}
+
+.custom-toolbox__header-delete-badge {
+  width: auto;
+  height: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent !important;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.custom-toolbox__header-delete-icon {
+  color: #e1592f;
+  font-size: 1.14rem !important;
+  flex-shrink: 0;
+}
+
+.custom-toolbox.is-deleting .custom-toolbox__header-label,
+.custom-toolbox.is-deleting .custom-toolbox__header-subtitle {
+  color: #e1592f;
+}
+
+.custom-toolbox__scroll {
+  position: relative;
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+/* Hide the scrollbar track but keep functionality */
+.custom-toolbox__scroll::-webkit-scrollbar {
+  width: 3px;
+}
+.custom-toolbox__scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-toolbox__scroll::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 2px;
+}
+
+/* ─── Accordion Category ──────────────────────────────────────────────────── */
+
+.toolbox-category {
+  border-radius: 10px !important;
+  overflow: hidden;
+  margin: 0 !important;
+  border: 1px solid #e2e8f0;
+  background-color: #ffffff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+  flex-shrink: 0;
+}
+
+.toolbox-category__header {
+  padding: 0 10px !important;
+  background-color: #ffffff !important;
+  min-height: 42px !important;
+  transition: background-color 0.18s ease;
+}
+
+.toolbox-category__header:hover {
+  background-color: #f8fafc !important;
+}
+
+.toolbox-category__header.Mui-expanded {
+  min-height: 42px !important;
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.toolbox-category__header .MuiAccordionSummary-content {
+  margin: 10px 0 !important;
+}
+
+.toolbox-category__header .MuiAccordionSummary-content.Mui-expanded {
+  margin: 10px 0 !important;
+}
+
+.toolbox-category__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.toolbox-category__accent {
+  width: 4px;
+  height: 20px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.toolbox-category__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.toolbox-category__name {
+  color: #0f172a !important;
+  font-size: 0.83rem !important;
+  font-weight: 600 !important;
+  line-height: 1.2;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbox-category__chevron {
+  color: #64748b;
+  font-size: 1.1rem !important;
+}
+
+/* No height cap by default: an open category renders at its natural size and
+   the palette around it is the one thing that scrolls.
+
+   A 260px cap with an inner scroll is wrong even for one category: Robot
+   Actions holds seven pills, which is 16px of padding + 7x32 + 6x6 = 276px, so
+   the category open on load would clip its last pill and scroll a sixteen-pixel
+   window to reach it.
+
+   Capping every panel is worse once several can be open at once: each one
+   is then a scroll region nested inside the palette's own, and the wheel does
+   something different depending on which of them the pointer happens to be
+   over. */
+.toolbox-category__body {
+  background-color: #ffffff;
+  padding: 8px !important;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* The exception, and the only one: a category whose rows come from the
+   database. Objects, Locations, Skills and Saved Tasks are as long as the
+   operator's library, so without a bound one of them could push every other
+   category off the palette. The static categories cannot grow — their length
+   is decided in toolboxRegistry.ts, not at runtime. */
+.toolbox-category--bounded .toolbox-category__body {
+  max-height: 260px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.toolbox-category__body::-webkit-scrollbar {
+  width: 3px;
+}
+
+.toolbox-category__body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.toolbox-category__body::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 2px;
+}
+
+.toolbox-category-tabs {
+  width: calc(100% + 16px);
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  position: sticky;
+  top: -8px;
+  z-index: 3;
+  background: #ffffff;
+  border-bottom: 1px solid #cbd5e1;
+  margin: -8px -8px 2px;
+  flex-shrink: 0;
+}
+
+.toolbox-category-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 30px;
+  border: none;
+  border-bottom: 1px solid #cbd5e1;
+  border-radius: 1px 1px 0 0;
+  background: transparent;
+  color: #475569;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 6px 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+  margin-bottom: -1px;
+}
+
+.toolbox-category-tab--inactive {
+  background: transparent;
+  color: #475569;
+  border-bottom-color: #cbd5e1;
+}
+
+.toolbox-category-tab--inactive:hover {
+  background: #f8fafc;
+}
+
+.toolbox-category-tab__label {
+  color: inherit;
+  transition: all 0.2s ease;
+}
+
+.toolbox-category-tab__label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbox-category-tab--active {
+  font-weight: 700;
+}
+
+.toolbox-category-tab--objects.toolbox-category-tab--active,
+.toolbox-category-tab--positions.toolbox-category-tab--active,
+.toolbox-category-tab--actions.toolbox-category-tab--active {
+  background: #e8fef5;
+  color: #007a54;
+  border-bottom: 2px solid #00873e;
+}
+
+/* ─── Block Pill ──────────────────────────────────────────────────────────── */
+
+.toolbox-pill {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  flex-shrink: 0;
+  min-height: 32px;
+  background-color: #ffffff;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .toolbox-pill {
+    transition:
+      box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+      transform 0.15s ease,
+      border-color 0.2s ease;
+  }
+}
+
+.toolbox-pill:hover {
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.08);
+  transform: translateY(-1px);
+  border-color: rgba(99, 102, 241, 0.2);
+}
+
+.toolbox-pill:active {
+  cursor: grabbing;
+  transform: translateY(0);
+  box-shadow: 0 1px 2px rgba(99, 102, 241, 0.05);
+}
+
+.toolbox-pill:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+.toolbox-pill__label {
+  color: #334155;
+  font-size: 0.74rem;
+  font-weight: 500;
+  font-family:
+    'Geist',
+    'Inter',
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Block Preview Tooltip ──────────────────────────────────────────────── */
+
+.toolbox-preview-popper .MuiTooltip-arrow {
+  color: #ffffff;
+}
+
+.toolbox-preview-popper .MuiTooltip-arrow::before {
+  border: 1px solid #e2e8f0;
+  box-sizing: border-box;
+}
+
+.toolbox-preview-tooltip {
+  /* Same elevation as MENU_PAPER_SX (editor/menuStyles.ts) — one shadow
+     language for every popover/menu/tooltip in the editor. */
+  background-color: #ffffff !important;
+  border: 1px solid #e2e8f0;
+  color: #0f172a !important;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+  border-radius: 12px;
+  padding: 8px !important;
+  max-width: 320px !important;
+}
+
+.toolbox-preview-card {
+  width: 292px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toolbox-preview-card__header {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.toolbox-preview-card__category-pill {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  /* Neutral fallback until the per-category inline style overrides it —
+     avoids a flash of arbitrary blue for categories whose color fails to parse. */
+  border: 1px solid #e2e8f0;
+  background: #f1f5f9;
+  color: #334155;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1.25;
+  text-transform: none;
+}
+
+.toolbox-preview-card__category-pill-icon {
+  flex-shrink: 0;
+}
+
+.toolbox-preview-card__title {
+  margin: 0;
+  color: #0f172a;
+  font-size: 0.96rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.toolbox-preview-card__preview {
+  width: 100%;
+  height: 142px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  background-color: #f8fafc;
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgba(100, 116, 139, 0.2) 1px,
+    transparent 0
+  );
+  background-size: 10px 10px;
+}
+
+.toolbox-preview__mount {
+  width: 100%;
+  height: 100%;
+}
+
+.toolbox-preview-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.toolbox-preview-card__description {
+  margin: 0;
+  color: #334155;
+  font-size: 0.72rem;
+  line-height: 1.42;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.toolbox-preview-card__io {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toolbox-preview-card__io-line {
+  color: #475569;
+  font-size: 0.7rem;
+  line-height: 1.3;
+}
+
+.toolbox-preview-card__footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 -8px -8px;
+  padding: 6px 8px;
+  border-top: 1px solid #e2e8f0;
+  background-color: #f1f5f9;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+.toolbox-preview-card__footer-icon {
+  color: #64748b;
+  font-size: 0.95rem !important;
+}
+
+.toolbox-preview-card__footer-text {
+  color: #475569;
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+/* ─── Toolbox - Delete Zone ─────────────────────────────────────── */
+.custom-toolbox__delete-overlay {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  z-index: 9999;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+    backdrop-filter 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+  -webkit-backdrop-filter: blur(0px);
+  backdrop-filter: blur(0px);
+}
+
+.custom-toolbox__delete-overlay--drag-intent {
+  opacity: 1;
+  background-color: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  pointer-events: auto;
+}
+
+.custom-toolbox__delete-overlay--hover-confirm {
+  opacity: 1;
+  background-color: rgba(200, 77, 40, 0.88);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  pointer-events: auto;
+}
+
+.custom-toolbox__delete-overlay-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  pointer-events: none;
+}
+
+.custom-toolbox__delete-overlay-icon {
+  /* ease-out-quart, not the back-easing that was here. The old curve's 1.56
+     control point overshoots and springs back, which reads as playful on a
+     control whose job is to say "this block is about to be deleted". */
+  transition:
+    transform 0.2s cubic-bezier(0.25, 1, 0.5, 1),
+    color 0.22s ease;
+}
+
+.custom-toolbox__delete-overlay-text {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.3px;
+  transition: color 0.22s ease;
+}
+
+.custom-toolbox__delete-overlay--drag-intent
+  .custom-toolbox__delete-overlay-icon,
+.custom-toolbox__delete-overlay--drag-intent
+  .custom-toolbox__delete-overlay-text {
+  color: #475569;
+}
+
+.custom-toolbox__delete-overlay--hover-confirm
+  .custom-toolbox__delete-overlay-icon,
+.custom-toolbox__delete-overlay--hover-confirm
+  .custom-toolbox__delete-overlay-text {
+  color: #ffffff;
+}
+
+.custom-toolbox__delete-overlay--hover-confirm
+  .custom-toolbox__delete-overlay-icon {
+  transform: scale(1.18) translateY(-3px);
+}

@@ -1,48 +1,139 @@
-import React, { useEffect, useState } from 'react'
-import { Outlet } from 'react-router-dom'
+import React from 'react'
+import { Outlet, useLocation } from 'react-router-dom'
 import { useDispatch } from 'react-redux'
-// import { useTheme } from '@mui/material/styles'
-import { Box, Toolbar /* useMediaQuery */ } from '@mui/material'
+import { useTheme } from '@mui/material/styles'
+import { Box, Toolbar, useMediaQuery } from '@mui/material'
 
 import { useAppSelector } from 'store/reducers'
 import { openDrawer } from 'store/reducers/menu'
+import { LAYOUT } from 'utils/constants'
+
 import { MainDrawer } from './Drawer'
 import { Header } from './Header'
 
 export const MainLayout = () => {
-  // const theme = useTheme()
-  // const matchDownXL = useMediaQuery(theme.breakpoints.down('xl'))
+  const theme = useTheme()
+  const matchDownLG = useMediaQuery(theme.breakpoints.down('lg'))
   const dispatch = useDispatch()
+  const location = useLocation()
 
   const drawerOpen = useAppSelector((state) => state.menu.drawerOpen)
+  const isIDERoute = location.pathname.startsWith('/task/')
+  const showHeader = isIDERoute || matchDownLG
 
   // drawer toggler
-  const [open, setOpen] = useState(drawerOpen)
   const handleDrawerToggle = () => {
-    setOpen(!open)
-    dispatch(openDrawer(!open))
+    dispatch(openDrawer(!drawerOpen))
   }
 
-  // set media wise responsive drawer
-  /*   useEffect(() => {
-    setOpen(!matchDownXL)
-    dispatch(openDrawer(!matchDownXL))
-  }, [matchDownXL, dispatch]) */
-
-  useEffect(() => {
-    if (open !== drawerOpen) setOpen(drawerOpen)
-  }, [drawerOpen, open])
+  // Move focus into the new page on navigation. A single-page app swaps the
+  // DOM without the focus reset a real page load gives you: focus is left on
+  // whatever was clicked (or on <body> if that element is gone), so a keyboard
+  // user Tabs from the old position and a screen reader announces nothing.
+  // The page title is already updated per route by useDocumentTitle, which
+  // covers 2.4.2; this covers the focus half.
+  const mainRef = React.useRef<HTMLElement | null>(null)
+  const isFirstRenderRef = React.useRef(true)
+  React.useEffect(() => {
+    // Not on first paint: there the browser's own initial focus is correct,
+    // and stealing it would skip past the skip link.
+    if (isFirstRenderRef.current) {
+      isFirstRenderRef.current = false
+      return
+    }
+    mainRef.current?.focus()
+  }, [location.pathname])
 
   return (
-    <Box sx={{ display: 'flex', width: '100%' }}>
-      <Header open={open} handleDrawerToggle={handleDrawerToggle} />
-      <MainDrawer open={open} handleDrawerToggle={handleDrawerToggle} />
+    <Box
+      sx={{
+        display: 'flex',
+        width: '100%',
+        height: '100vh',
+        overflow: 'hidden',
+        // Publish the layout constants as CSS custom properties.
+        //
+        // utils/constants.ts has claimed since it was written that these
+        // "propagate automatically" — they did not: nothing ever set them, so
+        // every `var(--layout-appbar-height, 56px)` in a fixed panel was
+        // silently using its literal fallback. Correct today, and a trap the
+        // moment either height changes: the TS constant would move and the
+        // panels would not.
+        '--layout-appbar-height': `${LAYOUT.appBarHeight}px`,
+        '--layout-statusbar-height': `${LAYOUT.statusBarHeight}px`,
+        '--layout-gutter': `${LAYOUT.gutter}px`,
+      }}
+    >
+      <Box
+        component="a"
+        href="#main-content"
+        sx={{
+          position: 'absolute',
+          left: '8px',
+          top: '-48px',
+          zIndex: 2000,
+          padding: '8px 14px',
+          borderRadius: '8px',
+          // backgroundColor, NOT background: MUI's sx resolves palette paths
+          // for `color`, `bgcolor` and `backgroundColor` only. Written as
+          // `background` the string reached the CSS verbatim, was invalid, and
+          // was dropped — leaving white text on a white page, so the link
+          // appeared as an empty box and could not be read.
+          backgroundColor: 'primary.dark',
+          color: 'common.white',
+          fontSize: '13px',
+          fontWeight: 600,
+          textDecoration: 'none',
+          transition: 'top 0.15s ease',
+          '&:focus': {
+            top: '8px',
+            outline: '2px solid #fff',
+            outlineOffset: '2px',
+          },
+        }}
+      >
+        Skip to main content
+      </Box>
+      {showHeader && (
+        <Header open={drawerOpen} handleDrawerToggle={handleDrawerToggle} />
+      )}
+      <MainDrawer open={drawerOpen} handleDrawerToggle={handleDrawerToggle} />
       <Box
         component="main"
-        sx={{ width: '100%', flexGrow: 1, p: { xs: 2, sm: 3 } }}
+        id="main-content"
+        ref={mainRef}
+        // <main> is not focusable on its own, so without this the skip link
+        // above only scrolls the viewport: focus stays where it was and the
+        // next Tab resumes from the header, which is what the link exists to
+        // skip. -1 keeps it out of the tab sequence while making it a valid
+        // target for programmatic focus (the skip link, and the route-change
+        // focus reset below). Same pattern as #blocklyDiv.
+        tabIndex={-1}
+        sx={{
+          width: '100%',
+          // A focus ring on a whole page region is noise: it is focused only as
+          // a landing spot, never as a control.
+          outline: 'none',
+          flexGrow: 1,
+          p: isIDERoute ? 0 : { xs: 2, sm: 3 },
+          height: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: isIDERoute ? 'hidden' : 'auto',
+        }}
       >
-        <Toolbar />
-        <Outlet />
+        {showHeader && <Toolbar />}
+        <Box
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: isIDERoute ? 'hidden' : 'auto',
+          }}
+        >
+          <Outlet />
+        </Box>
       </Box>
     </Box>
   )

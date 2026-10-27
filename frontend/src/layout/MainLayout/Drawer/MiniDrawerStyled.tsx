@@ -1,48 +1,61 @@
-import { styled, Theme } from '@mui/material/styles'
-import Drawer from '@mui/material/Drawer'
+import { CSSObject, Theme } from '@mui/material/styles'
 
-import { drawerWidth } from 'utils/constants'
+import { drawerWidth, LAYOUT } from 'utils/constants'
 
-export const openedMixin = (theme: Theme) => ({
-  width: drawerWidth,
-  borderRight: `1px solid ${theme.palette.divider}`,
-  transition: theme.transitions.create('width', {
-    easing: theme.transitions.easing.sharp,
-    duration: theme.transitions.duration.enteringScreen,
-  }),
-  overflowX: 'hidden' as any,
-  boxShadow: 'none',
+const COLLAPSED_WIDTH = 56
+
+// Collapsed root reserves the rail width *plus* the gutter, so the floating
+// paper stays a full 56px wide — NavItem's icon column + padding (28+6+8+16
+// = 58px, see NavItem.tsx) needs that full width and clips/overflows the
+// rounded card if the paper itself is shrunk instead. Open state doesn't
+// have this problem (240-12=228px has plenty of room), so only closed
+// differs: root grows by the gutter rather than paper shrinking by it.
+export const RAIL_CLOSED_WIDTH = COLLAPSED_WIDTH + LAYOUT.gutter
+
+// Every other animated panel in the shell (chat resize, Digital Twin slide,
+// editor width when the Twin opens) moves on cubic-bezier(0.4,0,0.2,1) @ 300ms,
+// so the rail does too rather than MUI Drawer's default 'sharp' easing. Rail
+// root, rail paper, and the AppBar (which must stay in lockstep with the rail)
+// all share this one definition.
+export const railTransition = (
+  theme: Theme,
+  property: string | string[],
+): string =>
+  theme.transitions.create(property, {
+    easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+    duration: 300,
+  })
+
+// The rail is a floating card, like the workspace panels — but the *root*
+// Drawer element must keep reserving the full drawerWidth/RAIL_CLOSED_WIDTH in
+// normal flow (AppBar/main content offsets read that reserved width), so only
+// the fixed *paper* is inset + radius + shadow. Root and paper are
+// intentionally different sizes; do not re-merge them.
+const floatingPaperStyle = (theme: Theme, width: number): CSSObject => ({
+  width,
+  margin: `${LAYOUT.gutter}px 0 ${LAYOUT.gutter}px ${LAYOUT.gutter}px`,
+  height: `calc(100vh - ${LAYOUT.gutter * 2}px)`,
+  borderRadius: '16px',
+  border: `1px solid ${theme.palette.divider}`,
+  boxShadow: theme.customShadows.card,
+  overflow: 'hidden', // clip header/footer squares to the rounded card
+  transition: railTransition(theme, 'width'),
 })
 
-export const closedMixin = (theme: Theme) => ({
-  transition: theme.transitions.create('width', {
-    easing: theme.transitions.easing.sharp,
-    duration: theme.transitions.duration.leavingScreen,
-  }),
-  overflowX: 'hidden' as any,
-  width: 0,
-  borderRight: 'none',
-  boxShadow: (theme as any).customShadows.z1,
+export const openedMixin = (theme: Theme): CSSObject => ({
+  width: drawerWidth,
+  transition: railTransition(theme, 'width'),
+  overflowX: 'hidden',
 })
 
-interface MiniDrawerStyledProps {
-  theme: Theme
-  open: boolean
-}
+export const closedMixin = (theme: Theme): CSSObject => ({
+  width: RAIL_CLOSED_WIDTH,
+  transition: railTransition(theme, 'width'),
+  overflowX: 'hidden',
+})
 
-export const MiniDrawerStyled = styled(Drawer, {
-  shouldForwardProp: (prop) => prop !== 'open',
-})((p: MiniDrawerStyledProps) => ({
-  width: drawerWidth,
-  flexShrink: 0,
-  whiteSpace: 'nowrap',
-  boxSizing: 'border-box',
-  ...(p.open && {
-    ...openedMixin(p.theme),
-    '& .MuiDrawer-paper': openedMixin(p.theme),
-  }),
-  ...(!p.open && {
-    ...closedMixin(p.theme),
-    '& .MuiDrawer-paper': closedMixin(p.theme),
-  }),
-}))
+export const openedPaperMixin = (theme: Theme): CSSObject =>
+  floatingPaperStyle(theme, drawerWidth - LAYOUT.gutter)
+
+export const closedPaperMixin = (theme: Theme): CSSObject =>
+  floatingPaperStyle(theme, COLLAPSED_WIDTH)

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Bring-up for the Cobotta digital twin: Gazebo Harmonic + ros2_control.
+
+gz sim + robot_state_publisher + ros_gz_bridge (clock/camera) + controller spawners
++ the Flask/SocketIO app nodes. Source /opt/ros/jazzy/setup.bash and the workspace
+install/setup.bash, then: ros2 launch .../cobotta_ros2_control.launch.py
+"""
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+COB_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # ros2_ws/Cobotta
+
+
+def _spawner(names, timeout=40):
+    # --activate-as-group: one switch_controller call for all controllers.
+    # The call can still time out (default 10s) with the switch already done
+    # server-side. The retry then finds a controller active, and a STRICT group
+    # switch refuses the whole group, which leaves arm_controller and
+    # gripper_controller inactive and every move-joints answered "ok" but
+    # ignored. So --service-call-timeout and --switch-timeout are raised too:
+    # --controller-manager-timeout only covers the service appearing, not the
+    # switch call, and a cold start under Gazebo load can exceed 10s.
+    return Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[*names, "--controller-manager", "/controller_manager",
+                   "--controller-manager-timeout", str(timeout),
+                   "--service-call-timeout", "40",
+                   "--switch-timeout", "40",
+                   "--activate-as-group"],
+        output="screen",
+    )
+
+
+def _setup(context, *args, **kwargs):
+    ctrl_yaml = os.path.join(
+        get_package_share_directory("cobotta_rest_api"), "config", "controllers.yaml")
+
+    # Substitute the @CONTROLLERS_YAML@ token into a generated copy of the model.
+    # Source is Cobotta.sdf.template (not Cobotta.sdf) so COB_DIR never contains
+    # a same-named, unsubstituted file — see cwd note on the gz ExecuteProcess below.
+    gen_dir = os.path.join(COB_DIR, ".gen")
+    os.makedirs(gen_dir, exist_ok=True)
+    with open(os.path.join(COB_DIR, "Cobotta.sdf.template")) as f:
+        sdf = f.read()
+    with open(os.path.join(gen_dir, "Cobotta.sdf"), "w") as f:
+        f.write(sdf.replace("@CONTROLLERS_YAML@", ctrl_yaml))
+
+    # .gen first (substituted model://Cobotta.sdf), then COB_DIR (meshes, world).
+    res_path = os.pathsep.join(
+        [gen_dir, COB_DIR, os.environ.get("GZ_SIM_RESOURCE_PATH", "")])
+    plugin_path = os.pathsep.join(
+        ["/opt/ros/jazzy/lib", os.environ.get("GZ_SIM_SYSTEM_PLUGIN_PATH", "")])
+    gz_env = dict(os.environ,
+                  GZ_SIM_RESOURCE_PATH=res_path,
+                  GZ_SIM_SYSTEM_PLUGIN_PATH=plugin_path)
+
+    with open(os.path.join(COB_DIR, "urdf", "cobotta_ik.urdf")) as f:
+        robot_description = f.read()
+
+    # cwd=COB_DIR (explicit, not left to the caller's shell): gz/sdformat resolves
+    # bare relative URIs/paths (model://Cobotta.sdf, objects/*/model.sdf, loose
+    # mesh textures) against the process's own working directory before
+    # GZ_SIM_RESOURCE_PATH. COB_DIR is where objects/, locations/, meshes/ etc.
+    # actually live, so this must be explicit regardless of the invoking shell's
+    # cwd. Cobotta.sdf itself is sourced from Cobotta.sdf.template (see above) so
+    # COB_DIR never has a same-named unsubstituted file to collide with — an
+    # earlier attempt to fix this by pointing cwd at .gen instead broke every
+    # other bare-relative asset lookup (confirmed empirically 2026-07-07: objects/
+    # locations spawn "Could not resolve file [texture.png]" once cwd left COB_DIR).
+    gui_enabled = LaunchConfiguration("gui").perform(context).lower() in ("1", "true", "yes")
+    gz_cmd = ["gz", "sim", "-r"]
+    if not gui_enabled:
+        gz_cmd.extend(["-s", "--headless-rendering"])
+    gz_cmd.append(os.path.join(COB_DIR, "worldCobotta.sdf"))
+
+    gz = ExecuteProcess(
+        cmd=gz_cmd,
+        additional_env=gz_env, cwd=COB_DIR, output="screen")
+
+    rsp = Node(
+        package="robot_state_publisher", executable="robot_state_publisher",
+        parameters=[{"use_sim_time": True, "robot_description": robot_description}],
+        output="screen")
+
+    bridge = Node(
+        package="ros_gz_bridge", executable="parameter_bridge",
+        arguments=["--ros-args", "-p",
+                   "config_file:=" + os.path.join(COB_DIR, "map_ros2_control.yaml")],
+        output="screen")
+
+    # Flask REST bridge (:5000, holds BridgeNodeROS) + SocketIO (:5001) + camera
+    # stream (:8080).
+    flask = Node(package="cobotta_rest_api", executable="flask_node", output="screen")
+    polling = Node(package="cobotta_rest_api", executable="polling_socket_node",
+                   output="screen")
+    web_video = Node(package="web_video_server", executable="web_video_server",
+                     output="screen")
+
+    nodes = [
+        gz, rsp, bridge,
+        _spawner(["joint_state_broadcaster", "arm_controller", "gripper_controller"]),
+        flask, polling, web_video,
+    ]
+
+    # hardware:=true also drives the real Cobotta over b-CAP alongside the twin.
+    if LaunchConfiguration("hardware").perform(context).lower() in ("1", "true", "yes"):
+        nodes.append(Node(
+            package="cobotta_rest_api", executable="cobotta_node", output="screen",
+            parameters=[{
+                "enable_hardware": True,
+                "bcap_host": LaunchConfiguration("bcap_host").perform(context),
+                "bcap_port": int(LaunchConfiguration("bcap_port").perform(context)),
+                "bcap_provider": LaunchConfiguration("bcap_provider").perform(context),
+                "ext_speed": int(LaunchConfiguration("ext_speed").perform(context)),
+            }]))
+
+    # vision:=true starts YOLO object detection. Run via `poetry run python <file>`,
+    # NOT `ros2 run` / Node(executable=...): ultralytics + mediapipe live in the Poetry
+    # env, so the ROS system python ImportErrors them (see CLAUDE.md).
+    if LaunchConfiguration("vision").perform(context).lower() in ("1", "true", "yes"):
+        proj_root = os.path.dirname(os.path.dirname(COB_DIR))  # ros2_ws/Cobotta -> repo root
+        vision_py = os.path.join(
+            proj_root, "ros2_ws", "src", "cobotta_rest_api", "cobotta_rest_api", "vision_node.py")
+        # Only the parameters that actually have a value.
+        #
+        # Every `-p` used to be appended unconditionally, and two of them are
+        # empty by default. That killed vision_node at startup, twice over,
+        # before it read a single frame:
+        #
+        #   camera_fallback default "0"  -> rclpy parses a bare 0 as INTEGER
+        #                                   while the node declares a STRING
+        #   yolo_classes    default ""   -> "-p yolo_classes:=" is not a
+        #                                   parseable override rule at all
+        #
+        # Both failed the same way from outside: the launch printed vision=1,
+        # nothing ever published on /vision/object_detected, and a find_object
+        # step aborted mid-run saying the object camera was not running. The
+        # message was true; the cause was here. Found during a live study
+        # session, twice, because fixing only the first one exposed the second.
+        #
+        # An absent parameter is also the RIGHT way to say "no value": the node
+        # declares its own defaults and tests them with plain truthiness
+        # (`if p("camera_fallback")`), so passing nothing means nothing.
+        vision_params = []
+        for name in ("camera_source", "camera_user", "camera_pass",
+                     "camera_fallback", "yolo_model", "yolo_classes"):
+            value = LaunchConfiguration(name).perform(context).strip()
+            if value:
+                vision_params += ["-p", f"{name}:={value}"]
+        nodes.append(ExecuteProcess(
+            cmd=["poetry", "run", "python", vision_py, "--ros-args", *vision_params],
+            cwd=proj_root, output="screen"))
+    return nodes
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument("gui", default_value="false"),
+        DeclareLaunchArgument("hardware", default_value="false"),
+        DeclareLaunchArgument("bcap_host", default_value="192.168.0.1"),
+        DeclareLaunchArgument("bcap_port", default_value="5007"),
+        # VRC works for the real RC8/COBOTTA over b-CAP; the RC8 provider errors
+        # E_INVALIDARG at controller_connect (verified on hardware).
+        DeclareLaunchArgument("bcap_provider", default_value="CaoProv.DENSO.VRC"),
+        DeclareLaunchArgument("ext_speed", default_value="20"),
+        DeclareLaunchArgument("vision", default_value="false"),
+        DeclareLaunchArgument("camera_source",
+                              default_value="http://192.168.0.90/-wvhttp-01-/image.cgi"),
+        DeclareLaunchArgument("camera_user", default_value="admin"),
+        DeclareLaunchArgument("camera_pass", default_value="password"),
+        # Auto-fallback if the Canon keeps failing (e.g. USB webcam "0"); "" disables.
+        # Empty, not "0". An unset fallback means "there is no second camera",
+        # and vision_node tests it with `if p("camera_fallback")` — "0" is a
+        # non-empty string, so the old default asked it to open a camera called
+        # "0" whenever the quoting above let it start at all.
+        DeclareLaunchArgument("camera_fallback", default_value=""),
+        # Default stays stock YOLOv8n; set yolo_classes to run an open-vocabulary
+        # model instead — see docs/vision-object-catalog.md §7.
+        DeclareLaunchArgument("yolo_model", default_value="yolov8n.pt"),
+        DeclareLaunchArgument("yolo_classes", default_value=""),
+        OpaqueFunction(function=_setup),
+    ])

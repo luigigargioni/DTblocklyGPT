@@ -1,11 +1,12 @@
-import React, { ReactNode, RefObject } from 'react'
-import { useTheme } from '@mui/material/styles'
+import React, { ReactNode } from 'react'
+import { SxProps, Theme, useTheme } from '@mui/material/styles'
 import {
   Button,
   Card,
   CardActionArea,
   CardContent,
   CardHeader,
+  Typography,
 } from '@mui/material'
 
 const headerSX = {
@@ -19,18 +20,20 @@ interface MainCardProps {
   boxShadow?: boolean
   elevation?: number
   shadow?: string
-  sx?: any
+  sx?: SxProps<Theme>
   title?: string
   subtitle?: string
   content?: boolean
   children?: ReactNode | ReactNode[]
-  contentSX?: any
-  backFunction?: any
-  onClick?: any
+  contentSX?: SxProps<Theme>
+  backFunction?: () => void
+  backTitle?: string
+  customElement?: ReactNode
+  onClick?: () => void
 }
 
-const defaultSx = {}
-const defaultContentSX = {}
+const defaultSx: SxProps<Theme> = {}
+const defaultContentSX: SxProps<Theme> = {}
 
 export const MainCard = ({
   ref,
@@ -44,10 +47,16 @@ export const MainCard = ({
   content = true,
   children = null,
   contentSX = defaultContentSX,
-  backFunction = null,
-  onClick = null,
+  backFunction,
+  backTitle = 'Back',
+  customElement = null,
+  onClick,
 }: MainCardProps) => {
   const theme = useTheme()
+  const customShadow = theme.customShadows?.card
+  const lightBorderColor = (
+    theme.palette.grey as typeof theme.palette.grey & { A800?: string }
+  ).A800
   const boxShadowThemed =
     theme.palette.mode === 'dark' ? boxShadow || true : boxShadow
 
@@ -57,11 +66,23 @@ export const MainCard = ({
       {title && (
         <CardHeader
           sx={headerSX}
-          titleTypographyProps={{ variant: 'h3' }}
-          title={title}
+          title={
+            <Typography variant="h3" component="h1">
+              {title}
+            </Typography>
+          }
           subheader={subtitle}
           action={
-            backFunction && <Button onClick={() => backFunction()}>Back</Button>
+            (backFunction || customElement) && (
+              <div
+                style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}
+              >
+                {customElement}
+                {backFunction && (
+                  <Button onClick={() => backFunction()}>{backTitle}</Button>
+                )}
+              </div>
+            )
           }
         />
       )}
@@ -75,22 +96,30 @@ export const MainCard = ({
   return (
     <Card
       elevation={elevation}
-      ref={ref as RefObject<HTMLDivElement>}
+      ref={ref}
       sx={{
         ...sx,
+        // MainLayout wraps every page in a flex column with overflow:auto so
+        // long pages scroll — but Card's own overflow:hidden (MUI default,
+        // for rounded-corner clipping) gives it an automatic min-height of 0
+        // as a flex item, so with the default flexShrink:1 it gets squeezed
+        // to the viewport's height instead of scrolling, silently clipping
+        // content. flexShrink:0 keeps it at its natural content height so
+        // the ancestor's overflow:auto can do its job.
+        flexShrink: 0,
         border: border ? '1px solid' : 'none',
-        borderRadius: 2,
+        borderRadius: 1, // × shape.borderRadius (8) = 8px
         borderColor:
           theme.palette.mode === 'dark'
             ? theme.palette.divider
-            : (theme.palette.grey as any).A800,
+            : lightBorderColor || theme.palette.divider,
         boxShadow:
           boxShadowThemed && (!border || theme.palette.mode === 'dark')
-            ? shadow || (theme as any).customShadows.z1
+            ? shadow || customShadow || theme.shadows[1]
             : 'inherit',
         ':hover': {
           boxShadow: boxShadowThemed
-            ? shadow || (theme as any).customShadows.z1
+            ? shadow || customShadow || theme.shadows[1]
             : 'inherit',
         },
         '& pre': {

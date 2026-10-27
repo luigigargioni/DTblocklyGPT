@@ -1,4 +1,5 @@
 from django.http import HttpResponse, HttpRequest
+from backend.utils.task_summary import summarize_task
 from backend.utils.response import (
     HttpMethod,
     invalid_request_method,
@@ -16,23 +17,42 @@ from django.contrib.auth.models import User
 
 
 def get_task_list(request: HttpRequest) -> HttpResponse:
+    """Returns all tasks (and macro tasks) owned by or shared with the user.
+    Used by the management UI — no status filter applied here.
+    """
     try:
         if request.user.is_authenticated:
             if request.method == HttpMethod.GET.value:
-                tasks = (
+                rows = (
                     Task.objects.filter(Q(owner=request.user) | Q(shared=True))
-                    .values(
-                        "id",
-                        "name",
-                        "description",
-                        "last_modified",
-                        "owner",
-                        "owner__username",
-                        "shared",
-                        "code",
+                    .only(
+                        "id", "name", "description", "last_modified", "owner",
+                        "shared", "task_type", "status", "signature",
+                        "published_workspace", "draft_workspace",
                     )
+                    .select_related("owner")
                     .order_by("-last_modified")
                 )
+                # `uses` is a handful of booleans derived from the workspace, not
+                # the workspace itself: the card needs to say whether a program
+                # moves the arm and what it waits for, and shipping the blocks to
+                # say it would turn a ~5 KB list into hundreds.
+                tasks = [
+                    {
+                        "id": t.id,
+                        "name": t.name,
+                        "description": t.description,
+                        "last_modified": t.last_modified,
+                        "owner": t.owner_id,
+                        "owner__username": t.owner.username if t.owner else None,
+                        "shared": t.shared,
+                        "task_type": t.task_type,
+                        "status": t.status,
+                        "signature": t.signature,
+                        "uses": summarize_task(t),
+                    }
+                    for t in rows
+                ]
                 return success_response(tasks)
             else:
                 return invalid_request_method()
@@ -47,23 +67,60 @@ def task_detail(request: HttpRequest) -> HttpResponse:
         if request.user.is_authenticated:
             if request.method == HttpMethod.GET.value:
                 task_id = request.GET.get("id")
-                task = Task.objects.filter(id=task_id).first()
+                # Same visibility boundary as get_task_list — a raw id lookup
+                # with no filter let any authenticated user read another
+                # user's private (non-shared) task by guessing/enumerating
+                # its id, bypassing the exact owner-or-shared check that
+                # already exists one function above in this file.
+                task = Task.objects.filter(
+                    Q(owner=request.user) | Q(shared=True), id=task_id
+                ).first()
                 if task is None:
                     return success_response()
-                task_fields = task.to_dict(
-                    [
-                        "id",
-                        "name",
-                        "description",
-                        "shared",
-                        "code",
-                    ]
-                )
+
+                # Unified read path: draft_workspace > published_workspace > workspace > code(legacy)
+                if task.draft_workspace is not None:
+                    raw_workspace = task.draft_workspace
+                elif task.published_workspace is not None:
+                    raw_workspace = task.published_workspace
+                elif task.workspace is not None:
+                    raw_workspace = task.workspace
+                elif task.code:
+                    try:
+                        from json import loads as _loads
+                        raw_workspace = _loads(task.code)
+                    except Exception:
+                        raw_workspace = None
+                else:
+                    raw_workspace = None
+
+                task_fields = {
+                    "id": task.id,
+                    "name": task.name,
+                    "description": task.description,
+                    "shared": task.shared,
+                    "owner": task.owner_id,
+                    "owner__username": task.owner.username,
+                    "task_type": task.task_type,
+                    "status": task.status,
+                    "code": raw_workspace,
+                    "signature": task.signature,
+                    "last_modified": task.last_modified,
+                }
                 return success_response(task_fields)
             if request.method == HttpMethod.DELETE.value:
                 data = loads(request.body)
                 task_id = data.get("id")
-                task = Task.objects.filter(id=task_id)
+                # Ownership only, unlike the GET above — Q(shared=True) is a
+                # *visibility* boundary (get_task_list uses it for reads),
+                # not a mutation grant. A first version of this fix reused
+                # the read filter here too, which let any authenticated
+                # user delete another user's shared task; the frontend
+                # already restricts Delete/Edit to the owner
+                # (listTasks.tsx's canManage), so the backend must match.
+                task = Task.objects.filter(owner=request.user, id=task_id)
+                if not task.exists():
+                    return error_response("Task not found", status=404)
                 task.delete()
                 return success_response()
             if request.method == HttpMethod.POST.value:
@@ -71,6 +128,7 @@ def task_detail(request: HttpRequest) -> HttpResponse:
                 task_name = data.get("name")
                 task_shared = data.get("shared")
                 task_description = data.get("description")
+                task_type = data.get("task_type", "task")
                 task_owner = User.objects.get(id=request.user.id)
                 date = getDateTimeNow()
                 # check if the name already exists
@@ -91,6 +149,7 @@ def task_detail(request: HttpRequest) -> HttpResponse:
                     description=task_description,
                     shared=task_shared,
                     last_modified=date,
+                    task_type=task_type,
                 )
                 response = {"id": task_created.id}
                 return success_response(response)
@@ -116,7 +175,13 @@ def task_detail(request: HttpRequest) -> HttpResponse:
                     data_result = {"nameAlreadyExists": True}
                     return bad_request("Name already exists", data_result)
 
-                Task.objects.filter(id=task_id).update(
+                # task_type is immutable after creation — never updated here.
+                # Ownership only for the mutation itself — see the DELETE
+                # branch above for why Q(shared=True) doesn't belong here.
+                task_qs = Task.objects.filter(owner=task_owner, id=task_id)
+                if not task_qs.exists():
+                    return error_response("Task not found", status=404)
+                task_qs.update(
                     name=task_name,
                     description=task_description,
                     shared=task_shared,
@@ -169,6 +234,8 @@ def object_detail(request: HttpRequest) -> HttpResponse:
                         "id",
                         "name",
                         "shared",
+                        "owner",
+                        "owner__username",
                         "height",
                         "contour",
                         "photo",
@@ -184,7 +251,12 @@ def object_detail(request: HttpRequest) -> HttpResponse:
             if request.method == HttpMethod.DELETE.value:
                 data = loads(request.body)
                 object_id = data.get("id")
-                object = Object.objects.filter(id=object_id)
+                # Ownership only, same reasoning as task_detail's DELETE — a
+                # raw id-only filter let any authenticated user delete
+                # another user's object, shared or not, by guessing its id.
+                object = Object.objects.filter(id=object_id, owner=request.user)
+                if not object.exists():
+                    return error_response("Object not found", status=404)
                 object.delete()
                 return success_response()
             if request.method == HttpMethod.POST.value:
@@ -323,7 +395,10 @@ def object_detail(request: HttpRequest) -> HttpResponse:
                     data_result = {"keywordExist": True, "keywordFound": keywordsFound}
                     return bad_request("Keyword already exists", data_result)
 
-                Object.objects.filter(id=object_id).update(
+                object_qs = Object.objects.filter(id=object_id, owner=request.user)
+                if not object_qs.exists():
+                    return error_response("Object not found", status=404)
+                object_qs.update(
                     name=object_name,
                     shared=object_shared,
                     height=object_height,
@@ -380,6 +455,8 @@ def action_detail(request: HttpRequest) -> HttpResponse:
                         "id",
                         "name",
                         "shared",
+                        "owner",
+                        "owner__username",
                         "speed",
                         "pattern",
                         "height",
@@ -391,7 +468,9 @@ def action_detail(request: HttpRequest) -> HttpResponse:
             if request.method == HttpMethod.DELETE.value:
                 data = loads(request.body)
                 action_id = data.get("id")
-                action = Action.objects.filter(id=action_id)
+                action = Action.objects.filter(id=action_id, owner=request.user)
+                if not action.exists():
+                    return error_response("Skill not found", status=404)
                 action.delete()
                 return success_response()
             if request.method == HttpMethod.POST.value:
@@ -515,7 +594,10 @@ def action_detail(request: HttpRequest) -> HttpResponse:
                     data_result = {"keywordExist": True, "keywordFound": keywordsFound}
                     return bad_request("Keyword already exists", data_result)
 
-                Action.objects.filter(id=action_id).update(
+                action_qs = Action.objects.filter(id=action_id, owner=request.user)
+                if not action_qs.exists():
+                    return error_response("Skill not found", status=404)
+                action_qs.update(
                     name=action_name,
                     shared=action_shared,
                     speed=action_speed,
@@ -562,6 +644,8 @@ def location_detail(request: HttpRequest) -> HttpResponse:
                         "id",
                         "name",
                         "shared",
+                        "owner",
+                        "owner__username",
                         "position",
                         "keywords",
                     ]
@@ -570,7 +654,9 @@ def location_detail(request: HttpRequest) -> HttpResponse:
             if request.method == HttpMethod.DELETE.value:
                 data = loads(request.body)
                 location_id = data.get("id")
-                location = Location.objects.filter(id=location_id)
+                location = Location.objects.filter(id=location_id, owner=request.user)
+                if not location.exists():
+                    return error_response("Location not found", status=404)
                 location.delete()
                 return success_response()
             if request.method == HttpMethod.POST.value:
@@ -692,7 +778,10 @@ def location_detail(request: HttpRequest) -> HttpResponse:
                     data_result = {"keywordExist": True, "keywordFound": keywordsFound}
                     return bad_request("Keyword already exists", data_result)
 
-                Location.objects.filter(id=location_id).update(
+                location_qs = Location.objects.filter(id=location_id, owner=request.user)
+                if not location_qs.exists():
+                    return error_response("Location not found", status=404)
+                location_qs.update(
                     name=location_name,
                     shared=location_shared,
                     position=location_position,

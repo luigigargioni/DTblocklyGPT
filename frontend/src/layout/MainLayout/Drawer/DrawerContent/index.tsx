@@ -1,16 +1,76 @@
 import React from 'react'
-import { Navigation } from './Navigation'
-import { SimpleBarScroll } from '../../../../components/SimpleBar'
+import { Box, Divider } from '@mui/material'
+import { HelpCircle } from 'lucide-react'
 
-export const DrawerContent = () => (
-  <SimpleBarScroll
-    sx={{
-      '& .simplebar-content': {
-        display: 'flex',
-        flexDirection: 'column',
-      },
-    }}
-  >
-    <Navigation />
-  </SimpleBarScroll>
-)
+import { MenuItem } from 'menu-items/types'
+
+import { Navigation } from './Navigation'
+import { NavItem, NAV_SEPARATOR_HEIGHT } from './Navigation/NavItem'
+
+// FAQ goes through the shared NavItem so it inherits the exact rail row metric,
+// icon column, tooltip, and selected pill — no special-case styling.
+const faqItem: MenuItem = {
+  id: 'faq',
+  title: 'Instructions & FAQ',
+  type: 'item',
+  url: '/faq',
+  icon: HelpCircle,
+}
+
+interface DrawerContentProps {
+  open: boolean
+}
+
+export const DrawerContent = ({ open }: DrawerContentProps) => {
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Scrollable navigation items. Native scrolling on purpose: this list
+          is a handful of rows and only scrolls on a very short viewport.
+          A JS scrollbar library would need its stylesheet imported, or its track
+          renders as an unstyled block in normal flow — a grey bar under the
+          last nav item. */}
+      <Box
+        sx={{
+          flexGrow: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          overflowY: 'auto',
+          // The rail rarely has enough items to scroll, so without this every
+          // wheel gesture over it went straight to the document.
+          overscrollBehavior: 'contain',
+          overflowX: 'hidden',
+        }}
+      >
+        <Navigation />
+      </Box>
+
+      {/* Pinned help link — same rail row metric as the nav items above. */}
+      {/* The row sits between two rules: this section's separator above and the
+          one over the profile below. Both are 17px tall with the line centred,
+          so on paper 8px of padding on each side would centre the item — and it
+          did not: the gap underneath rendered visibly larger. The padding below
+          is trimmed to match what the eye sees rather than what the box model
+          predicts, which is the only measurement that counts here. */}
+      <Box sx={{ pt: 1, pb: 0.25, bgcolor: 'background.paper' }}>
+        {/* Separator keeps NAV_SEPARATOR_HEIGHT in both states so toggling
+            the rail never moves the FAQ row (same rule as NavGroupHeader).
+            Collapsed: short centered hairline matching the group dividers
+            above; open: full width, like the footer border it replaces. It
+            is its own row rather than a border on this Box, so NavItem's
+            button still stretches full width like every other item. */}
+        <Box
+          aria-hidden
+          sx={{
+            height: NAV_SEPARATOR_HEIGHT,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <Divider sx={{ width: open ? '100%' : 24, borderColor: 'divider' }} />
+        </Box>
+        <NavItem item={faqItem} level={1} />
+      </Box>
+    </Box>
+  )
+}

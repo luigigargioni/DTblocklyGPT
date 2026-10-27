@@ -3,14 +3,116 @@ import { LocationListType } from 'pages/locations/types'
 import { ObjectListType } from 'pages/objects/types'
 import { AbstractCondition, AbstractStep } from 'pages/tasks/types'
 
+/**
+ * Parser for bidirectional conversion between Blockly blocks and abstract task representation.
+ *
+ * BLOCK SUPPORT STATUS:
+ *  FULLY SUPPORTED (Blockly ↔ backend):
+ *    - pick, place, processing, move_to, wait
+ *    - open_gripper, close_gripper (toolbox); gripper (legacy unified form, kept for back-compat)
+ *    - repeat, repeat_until, when, when_otherwise
+ *    - human_action, notify_action
+ *    - find_object, gesture, voice, timer, human_feedback
+ *    - logic_and, logic_or, logic_not
+ *    - macro_task (chat.py only ever echoes an existing one back, never authors from scratch)
+ *
+ *  REMOVED (no longer in toolbox or backend):
+ *    - loop_block: unsafe on non-replenishing real cell; serialization was null
+ *    - sensor_signal_block: redundant with program Stop + robot panic button
+ *    - touch_detect_block: collision-stop, not a readable condition
+ */
+
+// ---------------------------------------------
+// EXTENDED CUSTOM BLOCK INTERFACE
+// ---------------------------------------------
+export interface CustomBlock {
+  id?: string
+  type:
+    | 'object_block'
+    | 'location_block'
+    | 'action_block'
+    | 'pick_block'
+    | 'place_block'
+    | 'processing_block'
+    | 'move_to_block'
+    | 'gripper_block'
+    | 'open_gripper_block'
+    | 'close_gripper_block'
+    | 'repeat_block'
+    | 'repeat_until_block'
+    | 'when_block'
+    | 'when_otherwise_block'
+    | 'find_object_block'
+    | 'gesture_block'
+    | 'voice_command_block'
+    | 'timer_block'
+    | 'human_feedback_block'
+    | 'human_action_block'
+    | 'notify_action_block'
+    | 'wait_block'
+    | 'logic_and_block'
+    | 'logic_or_block'
+    | 'logic_not_block'
+    | 'when_start'
+    | 'macro_task_block'
+  inputs?: {
+    OBJECT?: { block?: CustomBlock; shadow?: CustomBlock }
+    LOCATION?: { block?: CustomBlock; shadow?: CustomBlock }
+    ACTION?: { block?: CustomBlock; shadow?: CustomBlock }
+    DO?: { block?: CustomBlock; shadow?: CustomBlock }
+    WHEN?: { block?: CustomBlock; shadow?: CustomBlock }
+    CONDITION?: { block?: CustomBlock; shadow?: CustomBlock }
+    OTHERWISE?: { block?: CustomBlock; shadow?: CustomBlock }
+    CONFIRM_EVENT?: { block?: CustomBlock; shadow?: CustomBlock }
+    A?: { block?: CustomBlock; shadow?: CustomBlock }
+    B?: { block?: CustomBlock; shadow?: CustomBlock }
+    BOOL?: { block?: CustomBlock; shadow?: CustomBlock }
+  }
+  data?: string
+  extraState?: string
+  fields?: {
+    times?: number
+    name?: string
+    TASK_DESCRIPTION?: string
+    TASK_DESC?: string
+    MOTION_TYPE?: 'LINEAR' | 'JOINT'
+    AXIS?: 'X' | 'Y' | 'Z'
+    DISTANCE?: number
+    GRIPPER_STATE?: 'OPEN' | 'CLOSE'
+    GESTURE_TYPE?:
+      'THUMBS_UP' | 'THUMBS_DOWN' | 'OPEN_HAND' | 'FIST' | 'PEACE' | 'OK'
+    VOICE_WORD?: 'YES' | 'NO' | 'DONE' | 'PROCEED'
+    SECONDS?: number
+    sensor?: string
+  }
+  next?: { block: CustomBlock }
+}
+
+/**
+ * Prefers a real block over a shadow block.
+ * Handles Blockly's serialization where unconnected inputs appear as
+ * { shadow: {...} } instead of { block: {...} }.
+ */
+const resolveBlock = (input?: {
+  block?: CustomBlock
+  shadow?: CustomBlock
+}): CustomBlock | undefined => input?.block ?? input?.shadow
+
+// ---------------------------------------------
+// ABSTRACT → BLOCKLY
+// ---------------------------------------------
+
+/**
+ * Converts an abstract task step sequence into a Blockly-compatible serialized block tree.
+ * The output can be loaded directly via Blockly's serialization APIs.
+ */
 export const abstractToBlockly = (
   abstractTask: AbstractStep[],
   dataObjects: ObjectListType[],
   dataLocations: LocationListType[],
   dataActions: ActionListType[],
 ) => {
-  // Helper to recursively convert steps
-  const stepToBlock = (step: AbstractStep) => {
+  const stepToBlock = (step: AbstractStep): any => {
     switch (step.type) {
       case 'pick': {
         const object = dataObjects.find((obj) => obj.id === step.objectId)
@@ -21,13 +123,11 @@ export const abstractToBlockly = (
               block: {
                 type: 'object_block',
                 data: JSON.stringify({
-                  blocklyId: step?.objectId || '',
-                  blocklyName: step?.objectName || '',
-                  id: object?.id,
-                  name: object?.name,
-                  keywords: object?.keywords.join(',') || '',
+                  id: object?.id ?? step.objectId ?? null,
+                  name: object?.name ?? step.objectName ?? null,
+                  keywords: object?.keywords?.join(',') ?? '',
                 }),
-                fields: { name: object?.name || step.objectName },
+                fields: { name: object?.name ?? step.objectName ?? '' },
               },
             },
           },
@@ -42,13 +142,11 @@ export const abstractToBlockly = (
               block: {
                 type: 'location_block',
                 data: JSON.stringify({
-                  blocklyId: step?.locationId || '',
-                  blocklyName: step?.locationName || '',
-                  id: location?.id,
-                  name: location?.name,
-                  keywords: location?.keywords.join(',') || '',
+                  id: location?.id ?? step.locationId ?? null,
+                  name: location?.name ?? step.locationName ?? null,
+                  keywords: location?.keywords?.join(',') ?? '',
                 }),
-                fields: { name: location?.name || step.locationName },
+                fields: { name: location?.name ?? step.locationName ?? '' },
               },
             },
           },
@@ -63,82 +161,140 @@ export const abstractToBlockly = (
               block: {
                 type: 'action_block',
                 data: JSON.stringify({
-                  blocklyId: step?.actionId || '',
-                  blocklyName: step?.actionName || '',
-                  id: action?.id,
-                  name: action?.name,
-                  keywords: action?.keywords.join(',') || '',
+                  id: action?.id ?? step.actionId ?? null,
+                  name: action?.name ?? step.actionName ?? null,
+                  keywords: action?.keywords?.join(',') ?? '',
                 }),
-                fields: { name: action?.name || step.actionName },
+                fields: { name: action?.name ?? step.actionName ?? '' },
               },
             },
           },
         }
       }
-      case 'repeat':
+      case 'move_to': {
+        const location = dataLocations.find((loc) => loc.id === step.locationId)
+        return {
+          type: 'move_to_block',
+          fields: { MOTION_TYPE: step.motionType ?? 'LINEAR' },
+          inputs: {
+            LOCATION: {
+              block: {
+                type: 'location_block',
+                data: JSON.stringify({
+                  id: location?.id ?? step.locationId ?? null,
+                  name: location?.name ?? step.locationName ?? null,
+                  keywords: location?.keywords?.join(',') ?? '',
+                }),
+                fields: { name: location?.name ?? step.locationName ?? '' },
+              },
+            },
+          },
+        }
+      }
+      case 'gripper':
+        return {
+          type: 'gripper_block',
+          fields: { GRIPPER_STATE: step.state ?? 'CLOSE' },
+        }
+      case 'open_gripper':
+        return { type: 'open_gripper_block' }
+      case 'close_gripper':
+        return { type: 'close_gripper_block' }
+      case 'macro_task':
+        return {
+          type: 'macro_task_block',
+          data: JSON.stringify({
+            id: step.macroId ?? null,
+            name: step.macroName ?? null,
+          }),
+          fields: { name: step.macroName ?? '' },
+        }
+      case 'wait':
+        return {
+          type: 'wait_block',
+          fields: { SECONDS: (step as any).seconds ?? 3 },
+        }
+      case 'repeat': {
+        const innerBlock = stepsToSequence(step.steps)
         return {
           type: 'repeat_block',
           fields: { times: step.times },
-          inputs: { DO: { block: stepsToSequence(step.steps) } },
+          inputs: innerBlock ? { DO: { block: innerBlock } } : { DO: {} },
         }
-      case 'when':
+      }
+      case 'repeat_until': {
+        const condBlock = conditionToBlock(step.condition)
+        const innerSteps = (step as any).do || step.steps
+        const innerBlock = stepsToSequence(innerSteps)
         return {
-          type: step.otherwise ? 'when_otherwise_block' : 'when_block',
+          type: 'repeat_until_block',
           inputs: {
-            WHEN: { block: conditionToBlock(step.condition) },
-            DO: { block: stepsToSequence(step.do) },
-            ...(step.otherwise
-              ? { OTHERWISE: { block: stepsToSequence(step.otherwise) } }
+            CONDITION: condBlock ? { block: condBlock } : {},
+            DO: innerBlock ? { block: innerBlock } : {},
+          },
+        }
+      }
+      case 'notify_action': {
+        return {
+          type: 'notify_action_block',
+          fields: { TASK_DESC: step.description ?? '' },
+        }
+      }
+      case 'when': {
+        // An empty array is truthy in JS — the LLM sends "otherwise": []
+        // for a plain "When → Do" step just as often as it omits the key
+        // entirely, so only a genuinely non-empty array should promote this
+        // to the Otherwise variant.
+        const otherwiseSteps = Array.isArray(step.otherwise)
+          ? step.otherwise
+          : []
+        const hasOtherwise = otherwiseSteps.length > 0
+        const condBlock = conditionToBlock(step.condition)
+        const doBlock = stepsToSequence(step.do)
+        const otherwiseBlock = hasOtherwise
+          ? stepsToSequence(otherwiseSteps)
+          : null
+        return {
+          type: hasOtherwise ? 'when_otherwise_block' : 'when_block',
+          inputs: {
+            WHEN: condBlock ? { block: condBlock } : {},
+            DO: doBlock ? { block: doBlock } : {},
+            ...(hasOtherwise
+              ? { OTHERWISE: otherwiseBlock ? { block: otherwiseBlock } : {} }
               : {}),
           },
         }
+      }
+      case 'human_action': {
+        const confirmBlock = conditionToBlock(step.confirmEvent)
+        return {
+          type: 'human_action_block',
+          fields: { TASK_DESC: step.description ?? '' },
+          inputs: {
+            CONFIRM_EVENT: confirmBlock ? { block: confirmBlock } : {},
+          },
+        }
+      }
       default:
         return null
     }
   }
 
-  // Helper to convert a sequence of steps into a linked block list
-  const stepsToSequence = (steps: AbstractStep[]) => {
-    if (!steps.length) return null
+  const stepsToSequence = (steps: AbstractStep[]): any => {
+    if (!steps || !steps.length) return null
     const [first, ...rest] = steps
     const block = stepToBlock(first)
+    if (!block) return stepsToSequence(rest) // skip unsupported, try next
     if (rest.length) {
-      block.next = { block: stepsToSequence(rest) }
+      const nextBlock = stepsToSequence(rest)
+      if (nextBlock) block.next = { block: nextBlock }
     }
     return block
   }
 
-  // Helper to convert condition
-  const conditionToBlock = (condition: AbstractCondition | null) => {
+  const conditionToBlock = (condition: AbstractCondition | null): any => {
     if (!condition) return null
     switch (condition.type) {
-      case 'sensor_signal':
-        if (!condition.sensor) return null
-        switch (condition.sensor) {
-          case 'camera':
-            return {
-              type: 'sensor_signal_block',
-              fields: { sensor: 'Camera sensor signal' },
-              data: JSON.stringify({
-                sensor: condition.sensor,
-              }),
-            }
-          case 'ir':
-            return {
-              type: 'sensor_signal_block',
-              fields: { sensor: 'IR sensor signal' },
-              data: JSON.stringify({
-                sensor: condition.sensor,
-              }),
-            }
-        }
-        return {
-          type: 'sensor_signal_block',
-          fields: { sensor: condition.sensor },
-          data: JSON.stringify({
-            sensor: condition.sensor,
-          }),
-        }
       case 'find_object': {
         const object = dataObjects.find((obj) => obj.id === condition.objectId)
         return {
@@ -148,114 +304,256 @@ export const abstractToBlockly = (
               block: {
                 type: 'object_block',
                 data: JSON.stringify({
-                  blocklyId: condition?.objectId || '',
-                  blocklyName: condition?.objectName || '',
-                  id: object?.id,
-                  name: object?.name,
-                  keywords: object?.keywords.join(',') || '',
+                  id: object?.id ?? condition.objectId ?? null,
+                  name: object?.name ?? condition.objectName ?? null,
+                  keywords: object?.keywords?.join(',') ?? '',
                 }),
-                fields: { name: object?.name || condition?.objectName },
+                fields: { name: object?.name ?? condition.objectName ?? '' },
               },
             },
           },
         }
       }
+      case 'gesture':
+        return {
+          type: 'gesture_block',
+          fields: { GESTURE_TYPE: condition.gestureType ?? 'THUMBS_UP' },
+        }
+      case 'voice':
+        return {
+          type: 'voice_command_block',
+          fields: { VOICE_WORD: condition.voiceWord ?? 'YES' },
+        }
+      case 'timer':
+        return {
+          type: 'timer_block',
+          fields: { SECONDS: condition.seconds ?? 5 },
+        }
       case 'human_feedback':
         return { type: 'human_feedback_block' }
+      case 'and': {
+        const left = conditionToBlock(condition.left)
+        const right = conditionToBlock(condition.right)
+        return {
+          type: 'logic_and_block',
+          inputs: {
+            A: left ? { block: left } : {},
+            B: right ? { block: right } : {},
+          },
+        }
+      }
+      case 'or': {
+        const left = conditionToBlock(condition.left)
+        const right = conditionToBlock(condition.right)
+        return {
+          type: 'logic_or_block',
+          inputs: {
+            A: left ? { block: left } : {},
+            B: right ? { block: right } : {},
+          },
+        }
+      }
+      case 'not': {
+        const inner = conditionToBlock(condition.condition)
+        return {
+          type: 'logic_not_block',
+          inputs: { BOOL: inner ? { block: inner } : {} },
+        }
+      }
       default:
         return null
     }
   }
 
-  // Root: wrap steps in a root block if needed, or just return the sequence
-  return {
-    ...stepsToSequence(abstractTask),
-  }
+  return { ...stepsToSequence(abstractTask) }
 }
 
-export interface CustomBlock {
-  id: string
-  type:
-    | 'pick_block'
-    | 'place_block'
-    | 'processing_block'
-    | 'repeat_block'
-    | 'when_block'
-    | 'when_otherwise_block'
-    | 'sensor_signal_block'
-    | 'find_object_block'
-    | 'human_feedback_block'
-  inputs?: {
-    OBJECT?: { block: CustomBlock }
-    LOCATION?: { block: CustomBlock }
-    ACTION?: { block: CustomBlock }
-    DO?: { block: CustomBlock }
-    WHEN?: { block: CustomBlock }
-    OTHERWISE?: { block: CustomBlock }
-  }
-  data?: string
-  extraState?: string
-  fields?: {
-    times?: number
-    name?: string
-  }
-  next?: { block: CustomBlock }
-}
+// ---------------------------------------------
+// BLOCKLY → ABSTRACT
+// ---------------------------------------------
 
-export const blocklyToAbstract = (
+/**
+ * Converts a Blockly serialized block tree to the AbstractStep representation
+ * used by task APIs and chat workflows.
+ */
+const blocklyToAbstract = (
   blocklyRoot: CustomBlock | null,
 ): AbstractStep[] | null => {
   if (!blocklyRoot) return null
 
-  // Helper to recursively convert blocks to steps
+  const getIdFromBlock = (block: CustomBlock | undefined): any => {
+    if (!block) return null
+    try {
+      if (block.data) {
+        const data = JSON.parse(block.data)
+        return data.id ?? null
+      }
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+
+  const getNameFromBlock = (block: CustomBlock | undefined): string => {
+    if (!block) return ''
+    try {
+      if (block.data) {
+        const data = JSON.parse(block.data)
+        return data.name ?? block.fields?.name ?? ''
+      }
+    } catch {
+      /* ignore */
+    }
+    return block.fields?.name ?? ''
+  }
+
+  const blockToCondition = (
+    block: CustomBlock | undefined,
+  ): AbstractCondition | null => {
+    if (!block) return null
+    switch (block.type) {
+      case 'find_object_block':
+        return {
+          type: 'find_object',
+          objectId: getIdFromBlock(resolveBlock(block.inputs?.OBJECT)),
+          objectName: getNameFromBlock(resolveBlock(block.inputs?.OBJECT)),
+        }
+      case 'gesture_block':
+        return {
+          type: 'gesture',
+          gestureType: block.fields?.GESTURE_TYPE ?? 'THUMBS_UP',
+        }
+      case 'voice_command_block':
+        return {
+          type: 'voice',
+          voiceWord: block.fields?.VOICE_WORD ?? 'YES',
+        }
+      case 'timer_block':
+        return { type: 'timer', seconds: block.fields?.SECONDS ?? 5 }
+      case 'human_feedback_block':
+        return { type: 'human_feedback' }
+      case 'logic_and_block': {
+        const left = blockToCondition(resolveBlock(block.inputs?.A))
+        const right = blockToCondition(resolveBlock(block.inputs?.B))
+        if (!left || !right) return null
+        return { type: 'and', left, right }
+      }
+      case 'logic_or_block': {
+        const left = blockToCondition(resolveBlock(block.inputs?.A))
+        const right = blockToCondition(resolveBlock(block.inputs?.B))
+        if (!left || !right) return null
+        return { type: 'or', left, right }
+      }
+      case 'logic_not_block': {
+        const condition = blockToCondition(resolveBlock(block.inputs?.BOOL))
+        if (!condition) return null
+        return { type: 'not', condition }
+      }
+      case 'notify_action_block':
+        return null
+      default:
+        return null
+    }
+  }
+
   const blockToStep = (block: CustomBlock): AbstractStep | null => {
     switch (block.type) {
       case 'pick_block':
         return {
           type: 'pick',
-          objectId: getIdFromBlock(block.inputs?.OBJECT?.block),
-          objectName: getNameFromBlock(block.inputs?.OBJECT?.block),
+          objectId: getIdFromBlock(resolveBlock(block.inputs?.OBJECT)),
+          objectName: getNameFromBlock(resolveBlock(block.inputs?.OBJECT)),
         }
       case 'place_block':
         return {
           type: 'place',
-          locationId: getIdFromBlock(block.inputs?.LOCATION?.block),
-          locationName: getNameFromBlock(block.inputs?.LOCATION?.block),
+          locationId: getIdFromBlock(resolveBlock(block.inputs?.LOCATION)),
+          locationName: getNameFromBlock(resolveBlock(block.inputs?.LOCATION)),
         }
       case 'processing_block':
         return {
           type: 'processing',
-          actionId: getIdFromBlock(block.inputs?.ACTION?.block) || '',
-          actionName: getNameFromBlock(block.inputs?.ACTION?.block) || '',
+          actionId: getIdFromBlock(resolveBlock(block.inputs?.ACTION)) ?? '',
+          actionName: getNameFromBlock(resolveBlock(block.inputs?.ACTION)),
         }
+      case 'move_to_block':
+        return {
+          type: 'move_to',
+          motionType: block.fields?.MOTION_TYPE ?? 'LINEAR',
+          locationId: getIdFromBlock(resolveBlock(block.inputs?.LOCATION)),
+          locationName: getNameFromBlock(resolveBlock(block.inputs?.LOCATION)),
+        }
+      case 'gripper_block':
+        return {
+          type: 'gripper',
+          state: block.fields?.GRIPPER_STATE ?? 'CLOSE',
+        }
+      case 'open_gripper_block':
+        return { type: 'open_gripper' }
+      case 'close_gripper_block':
+        return { type: 'close_gripper' }
+      case 'wait_block':
+        return {
+          type: 'wait',
+          seconds: Number(block.fields?.SECONDS ?? 3),
+        } as any
       case 'repeat_block':
         return {
           type: 'repeat',
           times: block.fields?.times ?? 1,
-          steps: sequenceToSteps(block.inputs?.DO?.block),
+          steps: sequenceToSteps(resolveBlock(block.inputs?.DO)),
+        }
+      case 'repeat_until_block':
+        return {
+          type: 'repeat_until',
+          condition: blockToCondition(resolveBlock(block.inputs?.CONDITION)),
+          do: sequenceToSteps(resolveBlock(block.inputs?.DO)),
+          steps: sequenceToSteps(resolveBlock(block.inputs?.DO)),
+        } as any
+      case 'notify_action_block':
+        return {
+          type: 'notify_action',
+          description: block.fields?.TASK_DESC ?? '',
         }
       case 'when_block':
         return {
           type: 'when',
-          condition: blockToCondition(block.inputs?.WHEN?.block),
-          do: sequenceToSteps(block.inputs?.DO?.block),
+          condition: blockToCondition(resolveBlock(block.inputs?.WHEN)),
+          do: sequenceToSteps(resolveBlock(block.inputs?.DO)),
         }
       case 'when_otherwise_block':
         return {
           type: 'when',
-          condition: blockToCondition(block.inputs?.WHEN?.block),
-          do: sequenceToSteps(block.inputs?.DO?.block),
-          otherwise: sequenceToSteps(block.inputs?.OTHERWISE?.block),
+          condition: blockToCondition(resolveBlock(block.inputs?.WHEN)),
+          do: sequenceToSteps(resolveBlock(block.inputs?.DO)),
+          otherwise: sequenceToSteps(resolveBlock(block.inputs?.OTHERWISE)),
         }
+      case 'human_action_block':
+        return {
+          type: 'human_action',
+          description: block.fields?.TASK_DESC ?? '',
+          confirmEvent: blockToCondition(
+            resolveBlock(block.inputs?.CONFIRM_EVENT),
+          ),
+        }
+      case 'macro_task_block':
+        return {
+          type: 'macro_task',
+          macroId: getIdFromBlock(block),
+          macroName: getNameFromBlock(block),
+        }
+      case 'when_start':
+        // when_start represents the start of a sequence but is not a step itself.
+        // Returning null allows sequenceToSteps to skip it and parse its next connected blocks.
+        return null
       default:
         return null
     }
   }
 
-  // Helper to convert a linked block list to an array of steps
   const sequenceToSteps = (block: CustomBlock | undefined): AbstractStep[] => {
     const steps: AbstractStep[] = []
-    let current = block
+    let current: CustomBlock | undefined = block
     while (current) {
       const step = blockToStep(current)
       if (step) steps.push(step)
@@ -264,58 +562,25 @@ export const blocklyToAbstract = (
     return steps
   }
 
-  // Helper to extract object/action/location ID from block
-  const getIdFromBlock = (block: CustomBlock | undefined) => {
-    if (!block) return ''
-    try {
-      if (block.data) {
-        const data = JSON.parse(block.data)
-        return data.id ?? null
-      }
-      return block.fields?.name ?? ''
-    } catch {
-      return block.fields?.name ?? ''
-    }
-  }
-
-  // Helper to extract object/action/location name from block
-  const getNameFromBlock = (block: CustomBlock | undefined) => {
-    if (!block) return ''
-    try {
-      if (block.data) {
-        const data = JSON.parse(block.data)
-        return data.name ?? null
-      }
-      return block.fields?.name ?? ''
-    } catch {
-      return block.fields?.name ?? ''
-    }
-  }
-
-  // Helper to convert condition block
-  const blockToCondition = (
-    block: CustomBlock | undefined,
-  ): AbstractCondition | null => {
-    if (!block) return null
-    switch (block.type) {
-      case 'sensor_signal_block': {
-        if (!block.data) return null
-        const data = JSON.parse(block.data)
-        return { type: 'sensor_signal', sensor: data.sensor }
-      }
-      case 'find_object_block':
-        return {
-          type: 'find_object',
-          objectId: getIdFromBlock(block.inputs?.OBJECT?.block),
-          objectName: getNameFromBlock(block.inputs?.OBJECT?.block),
-        }
-      case 'human_feedback_block':
-        return { type: 'human_feedback' }
-      default:
-        return null
-    }
-  }
-
-  // Compose the AbstractTask
   return sequenceToSteps(blocklyRoot)
+}
+
+/**
+ * Converts multiple top-level Blockly blocks (or a single block) into a single flattened
+ * AbstractStep list. Useful for parsing workspaces with multiple disconnected branches or standalone blocks.
+ */
+export const blocklyToAbstractAll = (
+  blocks: CustomBlock[] | CustomBlock | null,
+): import('pages/tasks/types').ASTBranch[] => {
+  if (!blocks) return []
+  const blockArray = Array.isArray(blocks) ? blocks : [blocks]
+  const branches: import('pages/tasks/types').ASTBranch[] = []
+  for (const block of blockArray) {
+    const isMain = block.type === 'when_start'
+    const steps = blocklyToAbstract(block)
+    if (steps && steps.length > 0) {
+      branches.push({ isMain, steps })
+    }
+  }
+  return branches
 }

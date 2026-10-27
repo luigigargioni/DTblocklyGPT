@@ -33,9 +33,7 @@ from .functions.robot import (
 )
 
 from .functions.chat import (
-    new_message,
     new_message_multimodal,
-    save_chat_task,
 )
 
 from .functions.graphic import (
@@ -44,11 +42,17 @@ from .functions.graphic import (
     get_action_graphic_list,
     get_location_graphic_list,
     get_object_graphic_list,
+    get_macro_list,
 )
 
-from .functions.task import run_task, analyze_task
-from .functions.simulate import simulate_task
+from .functions.simulate import simulate_task, stop_simulation, hardware_status, run_state
+from .functions.vision_live import process_vision_frame, process_voice_command, process_human_confirm
 
+from .functions.task_lifecycle import (
+    save_draft,
+    publish_task,
+    discard_draft,
+)
 
 API = "api/"
 AUTH = API + "auth/"
@@ -95,16 +99,10 @@ urlpatterns = [
     path(HOME + "resetPassword/", reset_password, name="reset_password"),
     path(HOME + "groups/", get_group_list, name="get_group_list"),
     # CHAT
-    path(CHAT + "newMessage/", new_message, name="new_message"),
     path(
         CHAT + "newMessageMultimodal/",
         new_message_multimodal,
         name="new_message_multimodal",
-    ),
-    path(
-        CHAT + "saveChatTask/",
-        save_chat_task,
-        name="save_chat_task",
     ),
     # GRAPHIC
     path(
@@ -132,11 +130,23 @@ urlpatterns = [
         get_action_graphic_list,
         name="get_action_graphic_list",
     ),
+    path(
+        GRAPHIC + "macroList/",
+        get_macro_list,
+        name="get_macro_list",
+    ),
     # TASK
-    path(TASK + "run/", run_task, name="run_task"),
     path(TASK + "simulate/", simulate_task, name="simulate_task"),
-    path(TASK + "analyze/", analyze_task, name="analyze_task"),
-    # Views
+    path(TASK + "simulate/stop/", stop_simulation, name="stop_simulation"),
+    path(TASK + "simulate/state/", run_state, name="run_state"),
+    path(TASK + "hardware-status/", hardware_status, name="hardware_status"),
+    path(TASK + "save-draft/", save_draft, name="save_draft"),
+    path(TASK + "publish/", publish_task, name="publish_task"),
+    path(TASK + "discard-draft/", discard_draft, name="discard_draft"),
+    path(API + "vision/frame/", process_vision_frame, name="vision_frame"),
+    path(API + "vision/voice/", process_voice_command, name="vision_voice"),
+    path(API + "human/confirm/", process_human_confirm, name="human_confirm"),
+    # Static + SPA catch-all (must be LAST)
     re_path(r"^static/(?P<path>.*)$", serve, {"document_root": settings.STATIC_ROOT}),
     re_path(r"^.*$", TemplateView.as_view(template_name="base.html")),
 ]

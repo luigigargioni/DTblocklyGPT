@@ -1,6 +1,6 @@
 import React from 'react'
-import { CircularProgress, Typography } from '@mui/material'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Button, CircularProgress, Stack, Typography } from '@mui/material'
+import { useNavigate, useParams } from 'react-router-dom'
 import useSWR from 'swr'
 import { useDispatch } from 'react-redux'
 
@@ -8,6 +8,9 @@ import { MainCard } from 'components/MainCard'
 import { endpoints } from 'services/endpoints'
 import { activeItem } from 'store/reducers/menu'
 import { MyRobotType } from 'pages/myrobots/types'
+import { useDocumentTitle } from 'hooks/useDocumentTitle'
+import { getFromLocalStorage, LocalStorageKey } from 'utils/localStorageUtils'
+
 import { FormAction } from './formAction'
 import { ActionDetailType } from './types'
 
@@ -15,21 +18,29 @@ const DetailAction = () => {
   const { id } = useParams()
   const navigate = useNavigate()
   const dispatch = useDispatch()
-  const [searchParams] = useSearchParams()
-  const returnGraphic = searchParams.get('returnGraphic')
   const insertMode = id === 'add'
-  const { data: dataAction, isLoading: isLoadingAction } = useSWR<
-    ActionDetailType,
-    Error
-  >(!insertMode ? { url: endpoints.home.libraries.action, body: { id } } : null)
+  useDocumentTitle(insertMode ? 'Add Skill' : 'Skill Detail')
+
+  const storedUser: unknown = getFromLocalStorage(LocalStorageKey.USER)
+  const currentUserId =
+    typeof storedUser === 'object' &&
+    storedUser !== null &&
+    'id' in storedUser &&
+    (typeof storedUser.id === 'string' || typeof storedUser.id === 'number')
+      ? String(storedUser.id)
+      : null
+  const {
+    data: dataAction,
+    error: actionError,
+    isLoading: isLoadingAction,
+    mutate: mutateAction,
+  } = useSWR<ActionDetailType, Error>(
+    !insertMode ? { url: endpoints.home.libraries.action, body: { id } } : null,
+  )
 
   const backFunction = () => {
-    if (returnGraphic) {
-      navigate(`/graphic/${returnGraphic}`)
-    } else {
-      dispatch(activeItem('actions'))
-      navigate('/actions')
-    }
+    void dispatch(activeItem('actions'))
+    void navigate('/actions')
   }
 
   const { data: dataMyRobots, isLoading: isLoadingMyRobots } = useSWR<
@@ -41,30 +52,47 @@ const DetailAction = () => {
 
   const isLoading = isLoadingAction || isLoadingMyRobots
   const data = dataAction && dataMyRobots
+  const loadError = !insertMode && !isLoadingAction && !!actionError
+  const notFound =
+    !insertMode && !isLoadingAction && !actionError && dataAction === undefined
+  const readOnly =
+    !insertMode &&
+    dataAction !== undefined &&
+    currentUserId !== null &&
+    String(dataAction.owner) !== currentUserId &&
+    dataAction.shared
 
   const subtitle = insertMode
-    ? 'Here you can define the detail of the Action. Stay hover the fields to see the description.'
-    : 'Here you can edit the detail of the Action. Stay hover the fields to see the description.'
+    ? 'Here you can define the details of the Skill. Hover over fields to see their descriptions.'
+    : 'Here you can edit the details of the Skill. Hover over fields to see their descriptions.'
 
   return (
     <MainCard
-      title={insertMode ? 'Add action' : 'Action detail'}
+      title={insertMode ? 'Add Skill' : 'Skill Detail'}
       subtitle={subtitle}
       backFunction={backFunction}
-      backTitle={
-        returnGraphic
-          ? 'Return to the task graphic'
-          : 'Return to the list of actions'
-      }
+      backTitle="Return to Skills"
     >
       {isLoading && !insertMode && <CircularProgress />}
-      {data === null && <Typography>Action with ID {id} not found</Typography>}
+      {loadError && (
+        <Stack spacing={1.5} sx={{ alignItems: 'center', py: 4 }}>
+          <Typography variant="body2" color="error.dark">
+            Couldn&apos;t load this skill. Check your connection and try again.
+          </Typography>
+          <Button size="small" onClick={() => mutateAction()}>
+            Retry
+          </Button>
+        </Stack>
+      )}
+      {notFound && <Typography>Skill with ID {id} not found</Typography>}
       {(data || insertMode) && (
         <FormAction
           dataAction={dataAction}
           dataMyRobots={dataMyRobots || []}
           insertMode={insertMode}
           backFunction={backFunction}
+          readOnly={readOnly}
+          ownerUsername={dataAction?.owner__username}
         />
       )}
     </MainCard>

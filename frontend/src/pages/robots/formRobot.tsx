@@ -1,3 +1,17 @@
+/**
+ * robot models (manager-only)
+ *
+ * One of six sibling CRUD forms (pages/{objects,actions,locations,robots,users,myrobots}/form*.tsx)
+ * that all share the same shape: Formik state + a yup schema, submitted through
+ * `fetchApi` from services/api.ts.
+ *
+ * The one part that is not boilerplate is the duplicate-name branch. `fetchApi`
+ * RESOLVES on 400/409 instead of rejecting (see the LANDMINE comment in
+ * services/api.ts), so a name collision arrives as a normal `.then()` carrying
+ * a flag in the payload — never as a `.catch()`. These forms therefore inspect
+ * the response body and push the error onto the field with `setFieldError`.
+ * Reading the collision from a rejected promise would silently never fire.
+ */
 import React from 'react'
 import {
   Button,
@@ -18,17 +32,22 @@ import {
   object as YupObject,
   number as YupNumber,
 } from 'yup'
-import { ApiOutlined } from '@ant-design/icons'
+import { Cable } from 'lucide-react'
 
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
+
 import { RobotModel, RobotType } from './types'
 
 interface FormRobotProps {
   data: RobotType | undefined
   insertMode: boolean
   backFunction: () => void
+}
+
+interface SaveRobotResponse {
+  nameAlreadyExists?: boolean
 }
 
 export const FormRobot = ({
@@ -41,9 +60,13 @@ export const FormRobot = ({
     { setStatus, setSubmitting, setFieldTouched, setFieldError },
   ) => {
     const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
-    fetchApi({ url: endpoints.home.management.robot, method, body: values })
+    void fetchApi<SaveRobotResponse, RobotType>({
+      url: endpoints.home.management.robot,
+      method,
+      body: values,
+    })
       .then(async (res) => {
-        if (res && res.nameAlreadyExists) {
+        if (res?.nameAlreadyExists) {
           await setFieldTouched('name', true)
           await setFieldError('name', MessageText.alreadyExists)
           setStatus({ success: false })
@@ -52,6 +75,9 @@ export const FormRobot = ({
         setStatus({ success: true })
         toast.success(MessageText.success)
         backFunction()
+      })
+      .catch(() => {
+        setStatus({ success: false })
       })
       .finally(() => {
         setSubmitting(false)
@@ -75,15 +101,19 @@ export const FormRobot = ({
       }
       return
     }
-    fetchApi({
+    void fetchApi({
       url: endpoints.home.libraries.pingIp,
       method: MethodHTTP.POST,
-      body: { ip },
-    }).then((response) => {
-      if (response) {
-        toast.success('IP available')
-      }
+      body: { ip, port },
     })
+      .then((response) => {
+        if (response) {
+          toast.success('IP available')
+        }
+      })
+      .catch(() => {
+        // fetchApi already surfaces a toast for the failure.
+      })
   }
 
   return (
@@ -124,13 +154,7 @@ export const FormRobot = ({
         setFieldError,
         setFieldTouched,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
+        <form noValidate onSubmit={handleSubmit}>
           <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
             <Grid size={2}>
               <Stack spacing={1}>
@@ -139,13 +163,18 @@ export const FormRobot = ({
                   value={values.name || ''}
                   name="name"
                   label="Name"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
                   error={Boolean(touched.name && errors.name)}
+                  aria-invalid={Boolean(touched.name && errors.name)}
+                  aria-describedby={
+                    touched.name && errors.name ? 'helper-text-name' : undefined
+                  }
                   title="Name of the robot"
                 />
                 {touched.name && errors.name && (
-                  <FormHelperText error id="helper-text-name">
+                  <FormHelperText error role="alert" id="helper-text-name">
                     {errors.name}
                   </FormHelperText>
                 )}
@@ -154,16 +183,25 @@ export const FormRobot = ({
             <Grid size={2}>
               <Stack spacing={1}>
                 <FormControl fullWidth>
-                  <InputLabel id="model-label">Model</InputLabel>
+                  <InputLabel id="model-label" required>
+                    Model
+                  </InputLabel>
                   <Select
                     labelId="model-label"
                     id="model"
                     value={values.model || ''}
                     label="Model"
                     name="model"
+                    required
                     onBlur={handleBlur}
                     onChange={handleChange}
                     error={Boolean(touched.model && errors.model)}
+                    aria-invalid={Boolean(touched.model && errors.model)}
+                    aria-describedby={
+                      touched.model && errors.model
+                        ? 'helper-text-model'
+                        : undefined
+                    }
                     title="Model of the robot"
                   >
                     {Object.entries(RobotModel).map(([k, v]) => (
@@ -173,7 +211,7 @@ export const FormRobot = ({
                     ))}
                   </Select>
                   {touched.model && errors.model && (
-                    <FormHelperText error id="helper-text-model">
+                    <FormHelperText error role="alert" id="helper-text-model">
                       {errors.model}
                     </FormHelperText>
                   )}
@@ -190,6 +228,7 @@ export const FormRobot = ({
                   value={values.ip || ''}
                   name="ip"
                   label="IP"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
                   title="IP address of the robot"
@@ -199,9 +238,13 @@ export const FormRobot = ({
                     },
                   }}
                   error={Boolean(touched.ip && errors.ip)}
+                  aria-invalid={Boolean(touched.ip && errors.ip)}
+                  aria-describedby={
+                    touched.ip && errors.ip ? 'helper-text-ip' : undefined
+                  }
                 />
                 {touched.ip && errors.ip && (
-                  <FormHelperText error id="helper-text-ip">
+                  <FormHelperText error role="alert" id="helper-text-ip">
                     {errors.ip}
                   </FormHelperText>
                 )}
@@ -216,6 +259,7 @@ export const FormRobot = ({
                   name="port"
                   label="Port"
                   type="number"
+                  required
                   slotProps={{
                     htmlInput: {
                       min: 0,
@@ -226,10 +270,14 @@ export const FormRobot = ({
                   onBlur={handleBlur}
                   onChange={handleChange}
                   error={Boolean(touched.port && errors.port)}
+                  aria-invalid={Boolean(touched.port && errors.port)}
+                  aria-describedby={
+                    touched.port && errors.port ? 'helper-text-port' : undefined
+                  }
                   title="Port of the address to connect to the robot"
                 />
                 {touched.port && errors.port && (
-                  <FormHelperText error id="helper-text-port">
+                  <FormHelperText error role="alert" id="helper-text-port">
                     {errors.port}
                   </FormHelperText>
                 )}
@@ -250,7 +298,7 @@ export const FormRobot = ({
                   aria-label="detail"
                   size="medium"
                   title="Check connection to the robot IP and port"
-                  startIcon={<ApiOutlined style={{ fontSize: '2em' }} />}
+                  startIcon={<Cable size={20} />}
                 >
                   Check connection
                 </Button>
@@ -263,6 +311,7 @@ export const FormRobot = ({
                   value={values.cameraip || ''}
                   name="cameraip"
                   label="Camera IP"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
                   slotProps={{
@@ -271,17 +320,23 @@ export const FormRobot = ({
                     },
                   }}
                   error={Boolean(touched.cameraip && errors.cameraip)}
+                  aria-invalid={Boolean(touched.cameraip && errors.cameraip)}
+                  aria-describedby={
+                    touched.cameraip && errors.cameraip
+                      ? 'helper-text-cameraip'
+                      : undefined
+                  }
                   title="IP address of the camera of the robot"
                 />
                 {touched.cameraip && errors.cameraip && (
-                  <FormHelperText error id="helper-text-cameraip">
+                  <FormHelperText error role="alert" id="helper-text-cameraip">
                     {errors.cameraip}
                   </FormHelperText>
                 )}
               </Stack>
             </Grid>
             <Grid size={12}>
-              <Divider textAlign="left">Techical details</Divider>
+              <Divider textAlign="left">Technical details</Divider>
             </Grid>
             <Grid size={2}>
               <Stack spacing={1}>

@@ -1,0 +1,2484 @@
+/**
+ * BlocklyEditor.tsx
+ *
+ * Top-level editor component that wires together:
+ *  - Custom React toolbox (CustomToolbox)
+ *  - Interactive Blockly workspace (BlocklyWorkspace)
+ *  - Shadow-block picker popover (useShadowPicker + ShadowPickerMenu)
+ *  - Context-menu bridge (installContextMenuBridge)
+ *  - Workspace controls overlay (zoom, undo/redo)
+ *  - Confirmation dialogs (ConfirmDialog, InlineTaskDialog)
+ *
+ * Complex sub-systems (shadow picker catalog, dialog presentation) live in
+ * dedicated modules under editor/shadowPicker/ and editor/dialogs/.
+ * This file is responsible only for wiring them together and managing the
+ * Blockly workspace lifecycle.
+ */
+
+import * as Blockly from 'blockly/core'
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
+import {
+  Divider,
+  IconButton,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
+  Popover,
+  Switch,
+  Box,
+  Stack,
+  Typography,
+  Button,
+  Tooltip,
+} from '@mui/material'
+import {
+  Maximize,
+  Minus,
+  Plus,
+  Redo2,
+  Undo2,
+  Settings,
+  Keyboard,
+  Minimize2,
+  Maximize2,
+  Download,
+  Upload,
+  PanelLeft,
+  MoreHorizontal,
+  Search,
+} from 'lucide-react'
+import { toast } from 'react-toastify'
+
+import {
+  AbstractStep,
+  TaskDetailType,
+  TaskType,
+  isPublished,
+} from 'pages/tasks/types'
+import { ActionListType } from 'pages/actions/types'
+import { LocationListType } from 'pages/locations/types'
+import { ObjectListType } from 'pages/objects/types'
+import { editorState } from 'themes/theme'
+import { blocklyToAbstractAll, CustomBlock } from 'utils/blocklyParser'
+import { BlockState as State } from 'utils/blocklyTypes'
+import {
+  countRealBlocks,
+  disposeBlockWithBody,
+  getOwnBodyDescendants,
+} from 'utils/blocklySelection'
+import { isTypingInTextControl } from 'utils/keyboardGuards'
+
+import { CustomToolbox, ToolboxBlockItem } from '../toolbox'
+import {
+  type BlockViewMode,
+  type DeleteConfirmMode,
+  type ViewSettings,
+} from '../utils/useViewSettings'
+import { applyBlockViewMode } from '../utils/viewModePresentation'
+import { getCollapseState, setBodiesCollapsed } from '../utils/blockLayout'
+import { exportWorkspaceJson, importWorkspaceJson } from '../utils/workspaceIO'
+import { BlocklyWorkspace, getBlocklyStructure } from '../workspace'
+// Side-effect import: registers all Blockly block types (when_start, repeat_block, etc.)
+// before any workspace is injected. Must come before BlocklyWorkspace is mounted.
+import '../blocks/definitions'
+import '../styles/editor.css'
+
+import {
+  type ContextMenuAction,
+  type ContextMenuState,
+  type RequestInlineTaskConfirmation,
+  getMenuIconInfo,
+  getMenuOptionText,
+  installContextMenuBridge,
+} from './contextMenu'
+import { CustomToolboxDeleteArea, type DeleteZoneState } from './deleteArea'
+import { startSyntheticBlockDrag } from './dragProxy'
+import {
+  explodeMacro as expandMacroTask,
+  getMacroIdFromBlockData,
+} from './macroExplosion'
+import {
+  BlockSearchDialog,
+  InlineTaskDialog,
+  KeyboardHelpDialog,
+} from './dialogs'
+
+import { ConfirmDialog } from 'components/ConfirmDialog'
+import { GHOST_INPUT_MAP } from 'utils/ghostBlockManager'
+import { KeycapHint, modKey } from 'components/KeycapHint'
+import { SegmentedControl } from 'components/SegmentedControl'
+
+import type { ShadowPickerItem, ShadowPopoverType } from './shadowPicker/types'
+import {
+  APP_SHORTCUT_NAMES,
+  registerAppShortcuts,
+  warnOnShortcutDrift,
+} from './appShortcuts'
+import { MENU_PAPER_SX } from './menuStyles'
+import {
+  ShadowPickerMenu,
+  useShadowPicker,
+  setShadowIconState,
+  resolveShadowPopoverType,
+} from './shadowPicker'
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
+/** Block type identifier for the mandatory program entry-point block. */
+const START_BLOCK_TYPE = 'when_start' as const
+const SHADOW_START_BLOCK_TYPE = 'shadow_start_sequence_block' as const
+
+/** Minimum pointer movement (px) before a toolbox pill triggers a block drag. */
+const DRAG_THRESHOLD_PX = 5
+
+/**
+ * Event types that indicate a structural change to the workspace block tree.
+ * Used to decide when to re-serialise the program and fire onTaskStructureChange.
+ */
+const STRUCTURE_CHANGING_TYPES = new Set<string>([
+  Blockly.Events.BLOCK_CREATE,
+  Blockly.Events.BLOCK_DELETE,
+  Blockly.Events.BLOCK_MOVE,
+  Blockly.Events.BLOCK_CHANGE,
+])
+
+/**
+ * Event types that require re-evaluating which blocks are orphans
+ * (disconnected from the when_start chain).
+ */
+const ORPHAN_SYNC_TYPES = new Set<string>([
+  Blockly.Events.BLOCK_CREATE,
+  Blockly.Events.BLOCK_DELETE,
+  Blockly.Events.BLOCK_MOVE,
+  Blockly.Events.BLOCK_CHANGE,
+])
+
+// ─── START BLOCK HELPERS ──────────────────────────────────────────────────────
+
+/**
+ * Find the single when_start entry-point block in the workspace.
+ * Returns null if it has not been inserted yet.
+ */
+/**
+ * True while the user is entering text, so a global keyboard shortcut must
+ * keep its hands off the event.
+ *
+ * Both shortcuts in this file listen on `document`, which means they fire no
+ * matter where focus is — including inside the HTML input Blockly opens for a
+ * `field_input` (the description on "Human action" and "Notify" blocks). The
+ * block stays selected while that editor is open, so an unguarded handler
+ * reads a keystroke meant for the text as a command aimed at the block.
+ *
+ * The two checks cover different failure modes: the shared element test catches
+ * focus genuinely sitting in a text control, and `WidgetDiv.isVisible()` catches
+ * any open Blockly field editor regardless of where it is mounted or where
+ * focus ended up. This is the editor-only extension of the app-wide guard —
+ * keep the element test in `utils/keyboardGuards` so the pages that must not
+ * import Blockly can share it, and add the Blockly-specific arm here.
+ */
+function isTypingContext(): boolean {
+  return isTypingInTextControl() || Blockly.WidgetDiv.isVisible()
+}
+
+function findStartBlock(
+  workspace: Blockly.WorkspaceSvg,
+): Blockly.BlockSvg | null {
+  return (
+    (workspace.getBlocksByType(
+      START_BLOCK_TYPE,
+      false,
+    )[0] as Blockly.BlockSvg) ?? null
+  )
+}
+
+/**
+ * Create the when_start entry-point block at the top-left of the workspace,
+ * mark it non-deletable and non-movable, and attach a shadow_start_sequence_block
+ * to its next connection slot.
+ *
+ * @returns The inserted block, or null if the block type is not yet registered.
+ */
+function insertStartBlock(
+  workspace: Blockly.WorkspaceSvg,
+): Blockly.BlockSvg | null {
+  if (!Blockly.Blocks[START_BLOCK_TYPE]) {
+    console.warn(
+      `insertStartBlock: Block type ${START_BLOCK_TYPE} not registered yet.`,
+    )
+    return null
+  }
+  const block = Blockly.serialization.blocks.append(
+    { type: START_BLOCK_TYPE },
+    workspace,
+  ) as Blockly.BlockSvg
+  block.initSvg()
+  block.render()
+  block.setDeletable(false)
+  block.setMovable(false)
+  block.moveBy(24, 24)
+
+  if (block.nextConnection) {
+    const shadow = workspace.newBlock('shadow_start_sequence_block')
+    shadow.setShadow(true)
+    shadow.initSvg()
+    shadow.render()
+    if (shadow.previousConnection) {
+      block.nextConnection.connect(shadow.previousConnection)
+    }
+  }
+  return block
+}
+
+/**
+ * Ensure the when_start block is present in the workspace.
+ * If it is missing (e.g. after undo or workspace clear), insert it silently
+ * without recording an undo event.
+ */
+function ensureStartBlock(workspace: Blockly.WorkspaceSvg): void {
+  if (findStartBlock(workspace)) return
+  Blockly.Events.disable()
+  try {
+    const inserted = insertStartBlock(workspace)
+    if (!inserted)
+      console.warn('[ensureStartBlock] when_start not yet registered')
+  } finally {
+    Blockly.Events.enable()
+  }
+}
+
+function removeStartBlock(workspace: Blockly.WorkspaceSvg): void {
+  const startBlocks = workspace.getBlocksByType(
+    START_BLOCK_TYPE,
+    false,
+  ) as Blockly.BlockSvg[]
+
+  Blockly.Events.disable()
+  try {
+    for (const startBlock of startBlocks) {
+      const target = startBlock.nextConnection?.targetBlock()
+      if (target) {
+        startBlock.nextConnection?.disconnect()
+        if (target.type === SHADOW_START_BLOCK_TYPE) {
+          if (target.nextConnection?.targetBlock()) {
+            target.nextConnection.disconnect()
+          }
+          if (!target.disposed) {
+            target.dispose(false)
+          }
+        }
+      }
+      if (!startBlock.disposed) {
+        startBlock.dispose(false)
+      }
+    }
+
+    const detachedStartShadows = workspace
+      .getBlocksByType(SHADOW_START_BLOCK_TYPE, false)
+      .filter((block) => !block.getParent()) as Blockly.BlockSvg[]
+
+    for (const shadow of detachedStartShadows) {
+      if (shadow.nextConnection?.targetBlock()) {
+        shadow.nextConnection.disconnect()
+      }
+      if (!shadow.disposed) {
+        shadow.dispose(false)
+      }
+    }
+  } finally {
+    Blockly.Events.enable()
+  }
+}
+
+function clearOrphanState(workspace: Blockly.WorkspaceSvg): void {
+  for (const block of workspace.getAllBlocks(false)) {
+    if (block.isShadow()) continue
+    if (block.isInsertionMarker()) continue
+    block.getSvgRoot?.()?.classList.remove('blockly-orphan')
+  }
+}
+
+function normalizeVisibleStartBlock(workspace: Blockly.WorkspaceSvg): void {
+  const startBlocks = workspace.getBlocksByType(
+    START_BLOCK_TYPE,
+    false,
+  ) as Blockly.BlockSvg[]
+  if (startBlocks.length === 0) return
+
+  Blockly.Events.disable()
+  try {
+    const [primaryStart, ...extraStarts] = startBlocks
+    primaryStart.setDeletable(false)
+    primaryStart.setMovable(false)
+
+    for (const extraStart of extraStarts) {
+      if (extraStart.nextConnection?.targetBlock()) {
+        extraStart.nextConnection.disconnect()
+      }
+      if (!extraStart.disposed) {
+        extraStart.dispose(false)
+      }
+    }
+
+    const detachedStartShadows = workspace
+      .getBlocksByType(SHADOW_START_BLOCK_TYPE, false)
+      .filter((block) => !block.getParent()) as Blockly.BlockSvg[]
+    for (const shadow of detachedStartShadows) {
+      if (shadow.nextConnection?.targetBlock()) {
+        shadow.nextConnection.disconnect()
+      }
+      if (!shadow.disposed) {
+        shadow.dispose(false)
+      }
+    }
+
+    const startTarget = primaryStart.nextConnection?.targetBlock()
+    if (startTarget?.type !== SHADOW_START_BLOCK_TYPE) return
+
+    const chainedBlock = startTarget.nextConnection?.targetBlock()
+    if (chainedBlock?.previousConnection) {
+      startTarget.nextConnection?.disconnect()
+      primaryStart.nextConnection?.disconnect()
+      if (!startTarget.disposed) {
+        startTarget.dispose(false)
+      }
+      primaryStart.nextConnection?.connect(chainedBlock.previousConnection)
+      return
+    }
+
+    const candidate = workspace
+      .getTopBlocks(true)
+      .find(
+        (block) =>
+          !block.disposed &&
+          !block.isShadow() &&
+          !block.isInsertionMarker() &&
+          !block.getParent() &&
+          block.type !== START_BLOCK_TYPE &&
+          block.type !== SHADOW_START_BLOCK_TYPE &&
+          Boolean(block.previousConnection),
+      )
+
+    if (!candidate?.previousConnection) return
+
+    primaryStart.nextConnection?.disconnect()
+    if (!startTarget.disposed) {
+      startTarget.dispose(false)
+    }
+    primaryStart.nextConnection?.connect(candidate.previousConnection)
+  } finally {
+    Blockly.Events.enable()
+  }
+}
+
+function syncStartBlockVisibility(
+  workspace: Blockly.WorkspaceSvg,
+  showStartBlock: boolean,
+): void {
+  if (showStartBlock) {
+    ensureStartBlock(workspace)
+    normalizeVisibleStartBlock(workspace)
+  } else {
+    removeStartBlock(workspace)
+  }
+}
+
+// ─── ORPHAN SYNC ──────────────────────────────────────────────────────────────
+
+/**
+ * Walk the connected block tree starting from when_start and toggle the
+ * CSS class `blockly-orphan` on every non-shadow, non-insertion-marker block
+ * that is not reachable from the start block.
+ *
+ * Orphan blocks are visually de-emphasised to communicate that they will
+ * not be part of the executed program.
+ */
+function syncOrphanState(workspace: Blockly.WorkspaceSvg): void {
+  const startBlock = findStartBlock(workspace)
+  const startId = startBlock?.id
+  const connectedIds = new Set<string>()
+
+  if (startBlock) {
+    const queue: Blockly.Block[] = [startBlock]
+    while (queue.length > 0) {
+      const b = queue.pop()!
+      connectedIds.add(b.id)
+      const next = b.getNextBlock()
+      if (next) queue.push(next)
+      for (const input of b.inputList) {
+        const target = input.connection?.targetBlock()
+        if (target) queue.push(target)
+      }
+    }
+  }
+
+  for (const block of workspace.getAllBlocks(false)) {
+    if (block.id === startId) continue
+    if (block.isShadow()) continue
+    if (block.isInsertionMarker()) continue
+    const isConnected = connectedIds.has(block.id)
+    block.getSvgRoot?.()?.classList.toggle('blockly-orphan', !isConnected)
+  }
+}
+
+// ─── SETTINGS POPOVER HELPERS ───────────────────────────────────────────────
+
+/** Compact label (+ optional caption) + Switch row used in the settings popover. */
+const SettingSwitch = ({
+  label,
+  caption,
+  checked,
+  onChange,
+}: {
+  label: string
+  caption?: string
+  checked: boolean
+  onChange: (value: boolean) => void
+}) => (
+  <Stack
+    direction="row"
+    sx={{ alignItems: 'center', justifyContent: 'space-between' }}
+  >
+    <Box>
+      <Typography variant="body2" sx={{ fontSize: 13, color: 'text.primary' }}>
+        {label}
+      </Typography>
+      {caption && (
+        <Typography
+          variant="caption"
+          sx={{ color: 'text.secondary', display: 'block', maxWidth: 200 }}
+        >
+          {caption}
+        </Typography>
+      )}
+    </Box>
+    <Switch
+      checked={checked}
+      onChange={(_e, value) => onChange(value)}
+      size="small"
+    />
+  </Stack>
+)
+
+/** OS-aware label for the block-search accelerator. */
+const ADD_BLOCK_SHORTCUT =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+    ? '⌘K'
+    : 'Ctrl+K'
+
+// ─── PROPS ────────────────────────────────────────────────────────────────────
+
+/** Props for the shared Blockly editor container. */
+interface BlocklyEditorProps {
+  dataLocations: LocationListType[]
+  dataObjects: ObjectListType[]
+  dataActions: ActionListType[]
+  dataMacros?: TaskType[]
+  macroDetailsById?: Record<number, TaskDetailType>
+  currentTaskId?: number
+  dataTask: State | State[] | null
+  pendingExternalTask?: State | null
+  editMode?: boolean
+  applyExternalTaskState?: boolean
+  onExternalTaskStateApplied?: () => void
+  onTaskStructureChange?: (
+    task: import('pages/tasks/types').ASTBranch[] | null,
+  ) => void
+  onWorkspaceReady?: (workspace: Blockly.WorkspaceSvg | null) => void
+  blockViewMode?: BlockViewMode
+  deleteConfirmMode?: DeleteConfirmMode
+  showStartBlock?: boolean
+  viewSettings?: ViewSettings
+  onViewSettingsChange?: (patch: Partial<ViewSettings>) => void
+  onResetViewSettings?: () => void
+}
+
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
+
+/**
+ * Full Blockly editor: custom toolbox, interactive workspace, controls, and
+ * context-menu bridge.
+ *
+ * Sub-systems are delegated to dedicated hooks/components:
+ *  - Shadow picker → useShadowPicker + ShadowPickerMenu
+ *  - Dialogs       → ConfirmDialog + InlineTaskDialog
+ *  - Context menu  → installContextMenuBridge (contextMenu.ts)
+ */
+export const BlocklyEditor = ({
+  dataLocations,
+  dataObjects,
+  dataActions,
+  dataMacros = [],
+  macroDetailsById = {},
+  currentTaskId,
+  dataTask,
+  pendingExternalTask,
+  editMode = true,
+  applyExternalTaskState = false,
+  onExternalTaskStateApplied,
+  onTaskStructureChange,
+  onWorkspaceReady,
+  blockViewMode = 'complete',
+  deleteConfirmMode = 'multiple',
+  showStartBlock = true,
+  viewSettings,
+  onViewSettingsChange,
+  onResetViewSettings,
+}: BlocklyEditorProps) => {
+  // ── Workspace refs ─────────────────────────────────────────────────────────
+  const workspaceRef = useRef<Blockly.WorkspaceSvg | null>(null)
+  const toolboxRootRef = useRef<HTMLElement | null>(null)
+  const deleteAreaRef = useRef<CustomToolboxDeleteArea | null>(null)
+  const deleteAreaWorkspaceRef = useRef<Blockly.WorkspaceSvg | null>(null)
+  const workspaceChangeListenerRef = useRef<
+    ((e: Blockly.Events.Abstract) => void) | null
+  >(null)
+  const pendingDragCleanupRef = useRef<(() => void) | null>(null)
+  const suppressDeleteZoneForNextDragRef = useRef(false)
+  const toolboxHoverTrackingCleanupRef = useRef<(() => void) | null>(null)
+  const contextMenuOptionIdRef = useRef(0)
+  const keydownCleanupRef = useRef<(() => void) | null>(null)
+  const onTaskStructureChangeRef = useRef(onTaskStructureChange)
+  useEffect(() => {
+    onTaskStructureChangeRef.current = onTaskStructureChange
+  }, [onTaskStructureChange])
+  const blockViewModeRef = useRef(blockViewMode)
+  useEffect(() => {
+    blockViewModeRef.current = blockViewMode
+  }, [blockViewMode])
+  const showStartBlockRef = useRef(showStartBlock)
+  useEffect(() => {
+    showStartBlockRef.current = showStartBlock
+  }, [showStartBlock])
+  const gridVisibleRef = useRef(viewSettings?.gridVisible ?? true)
+  useEffect(() => {
+    gridVisibleRef.current = viewSettings?.gridVisible ?? true
+  }, [viewSettings?.gridVisible])
+  const snapToGridRef = useRef(viewSettings?.snapToGrid ?? true)
+  useEffect(() => {
+    snapToGridRef.current = viewSettings?.snapToGrid ?? true
+  }, [viewSettings?.snapToGrid])
+  const lastDragEndTimeRef = useRef<number>(0)
+  const lastDragGroupRef = useRef<string>('')
+  const taskLoadedRef = useRef(false)
+
+  // ── UI state ───────────────────────────────────────────────────────────────
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [settingsAnchorEl, setSettingsAnchorEl] =
+    useState<HTMLButtonElement | null>(null)
+  const handleOpenSettings = (event: React.MouseEvent<HTMLButtonElement>) => {
+    setSettingsAnchorEl(event.currentTarget)
+  }
+  const handleCloseSettings = () => {
+    setSettingsAnchorEl(null)
+  }
+  const isSettingsOpen = Boolean(settingsAnchorEl)
+  const [keyboardHelpOpen, setKeyboardHelpOpen] = useState(false)
+  const [blockSearchOpen, setBlockSearchOpen] = useState(false)
+  const [moreMenuAnchorEl, setMoreMenuAnchorEl] =
+    useState<HTMLButtonElement | null>(null)
+  const isMoreMenuOpen = Boolean(moreMenuAnchorEl)
+  const closeMoreMenu = () => setMoreMenuAnchorEl(null)
+
+  const handleCollapseAll = useCallback((collapsed: boolean) => {
+    const workspace = workspaceRef.current
+    if (workspace) setBodiesCollapsed(workspace, collapsed)
+  }, [])
+
+  // Recomputed each time the menu opens, not on every render: the menu's
+  // children only exist while it is open, and the workspace can change under
+  // it between two openings.
+  const collapseState =
+    isMoreMenuOpen && workspaceRef.current
+      ? getCollapseState(workspaceRef.current)
+      : { canCollapse: false, canExpand: false }
+
+  const importFileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // Toolbox show/hide changes the canvas width — resize Blockly after reflow.
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    const id = requestAnimationFrame(() => Blockly.svgResize(workspace))
+    return () => cancelAnimationFrame(id)
+  }, [viewSettings?.toolboxCollapsed])
+
+  const handleExportTask = useCallback(() => {
+    const workspace = workspaceRef.current
+    if (workspace) exportWorkspaceJson(workspace, 'task')
+  }, [])
+
+  const runImport = useCallback(async (file: File) => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    try {
+      importWorkspaceJson(workspace, await file.text())
+      toast.success('Task imported')
+    } catch {
+      toast.error('Could not import: not a valid task file')
+    }
+  }, [])
+
+  const handleImportFile = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0]
+      event.target.value = '' // allow re-importing the same file
+      const workspace = workspaceRef.current
+      if (!file || !workspace) return
+
+      if (workspace.getAllBlocks(false).some((b) => !b.isShadow())) {
+        setConfirmDialog({
+          message:
+            'Importing replaces the blocks currently in this task. Continue?',
+          confirmLabel: 'Import',
+          onConfirm: () => {
+            setConfirmDialog(null)
+            void runImport(file)
+          },
+          onCancel: () => setConfirmDialog(null),
+        })
+        return
+      }
+
+      void runImport(file)
+    },
+    [runImport],
+  )
+
+  // Ctrl/Cmd+K → block search palette. Declared further down, after the dialog
+  // state it has to check (see anyDialogOpenRef).
+
+  // a11y: when the user opts into keyboard mode, force Blockly's keyboard-nav
+  // visuals always-on; turning it off deactivates them again. When off, Blockly
+  // still auto-activates keyboard nav on key use (v13).
+  useEffect(() => {
+    Blockly.keyboardNavigationController.setIsActive(
+      !!viewSettings?.keyboardMode,
+    )
+  }, [viewSettings?.keyboardMode])
+
+  // Turn the focus ring off again as soon as the pointer is used.
+  //
+  // Blockly enables keyboard-nav visuals from nineteen of its own code paths
+  // (Tab, every arrow, start-move, the context menu) and from our focusNode
+  // after an insert, but clears them from far fewer. The ring therefore
+  // survived into mouse work: the user clicked around the canvas with a focus
+  // box still drawn, which is not what a pointer user should ever see.
+  //
+  // Skipped when the user has explicitly switched Keyboard mode on — there the
+  // always-on ring is the point, and a stray click must not silently undo a
+  // setting they chose.
+  useEffect(() => {
+    if (viewSettings?.keyboardMode) return
+    const onPointerDown = () =>
+      Blockly.keyboardNavigationController.setIsActive(false)
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () =>
+      document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [viewSettings?.keyboardMode])
+  const [toolboxDeleteZoneState, setToolboxDeleteZoneState] =
+    useState<DeleteZoneState>('idle')
+  const [historyState, setHistoryState] = useState({
+    canUndo: false,
+    canRedo: false,
+  })
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  const [inlineTaskConfirm, setInlineTaskConfirm] = useState<{
+    macroName: string
+    onConfirm: () => void
+  } | null>(null)
+  const [confirmDialog, setConfirmDialog] = useState<{
+    message: string
+    onConfirm: () => void
+    onCancel: () => void
+    confirmLabel?: string
+  } | null>(null)
+
+  // Ctrl/Cmd+K → block search palette. A ref, not an effect dependency, so the
+  // listener is installed once and still sees the current dialog state.
+  const anyDialogOpenRef = useRef(false)
+  anyDialogOpenRef.current =
+    confirmDialog !== null || inlineTaskConfirm !== null || keyboardHelpOpen
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || (e.key !== 'k' && e.key !== 'K')) return
+      // Pressed while the user is editing a block's description, this yanked
+      // them out of the field and opened the search palette over their
+      // unfinished text.
+      if (isTypingContext()) return
+      // A confirmation is already up. isTypingContext() does not catch it —
+      // those dialogs put focus on a <button>, not a field — so without this
+      // the palette opened as a second modal on top of the first, leaving two
+      // MUI focus traps fighting over the same focus.
+      if (anyDialogOpenRef.current) return
+      e.preventDefault()
+      setBlockSearchOpen(true)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+
+  // Route Blockly's own confirmations through the app's ConfirmDialog.
+  // Blockly's default builds a native <dialog> with its own `blocklyDialog`
+  // stylesheet, so it looked like a different product — most visibly on the
+  // workspace menu's "Delete N Blocks", which never reaches the per-block
+  // confirm path below (that one is keyed on a blockId the workspace menu
+  // does not have). Installing it here covers every Blockly confirm at once
+  // rather than intercepting them one label at a time.
+  useEffect(() => {
+    Blockly.dialog.setConfirm((message, callback) => {
+      setConfirmDialog({
+        message,
+        onConfirm: () => {
+          setConfirmDialog(null)
+          callback(true)
+        },
+        onCancel: () => {
+          setConfirmDialog(null)
+          callback(false)
+        },
+      })
+    })
+    // No argument restores Blockly's default (see core/dialog.ts setConfirm).
+    return () => Blockly.dialog.setConfirm()
+  }, [])
+
+  // ── Exclude current task from macro list ───────────────────────────────────
+  const availableMacros = useMemo(() => {
+    const publishedMacros = dataMacros.filter(isPublished)
+    return currentTaskId === undefined
+      ? publishedMacros
+      : publishedMacros.filter((m) => m.id !== currentTaskId)
+  }, [currentTaskId, dataMacros])
+
+  // ── Shadow picker ──────────────────────────────────────────────────────────
+  const shadowPicker = useShadowPicker({
+    workspaceRef,
+    dataObjects,
+    dataLocations,
+    dataActions,
+    availableMacros,
+    showLogicOperators: !!viewSettings?.showLogicOperators,
+  })
+
+  // ── History sync ───────────────────────────────────────────────────────────
+  const syncHistoryState = useCallback(
+    (workspace: Blockly.WorkspaceSvg | null) => {
+      if (!workspace) {
+        setHistoryState({ canUndo: false, canRedo: false })
+        return
+      }
+      setHistoryState({
+        canUndo: workspace.getUndoStack().length > 0,
+        canRedo: workspace.getRedoStack().length > 0,
+      })
+    },
+    [],
+  )
+
+  const shouldConfirmDelete = useCallback(
+    (count: number) => {
+      if (deleteConfirmMode === 'never') return false
+      if (deleteConfirmMode === 'always') return count >= 1
+      return count > 1
+    },
+    [deleteConfirmMode],
+  )
+  const shouldConfirmDeleteRef = useRef(shouldConfirmDelete)
+  useEffect(() => {
+    shouldConfirmDeleteRef.current = shouldConfirmDelete
+  }, [shouldConfirmDelete])
+
+  const syncWorkspacePresentation = useCallback(
+    (workspace: Blockly.WorkspaceSvg) => {
+      applyBlockViewMode(workspace, blockViewModeRef.current)
+      const grid = workspace.getGrid()
+      if (grid) {
+        grid.setLength(gridVisibleRef.current ? 2 : 0)
+        grid.setSnapToGrid(snapToGridRef.current)
+        grid.update(workspace.scale)
+        Blockly.svgResize(workspace) // refresh the grid pattern
+      }
+      if (showStartBlockRef.current) {
+        syncOrphanState(workspace)
+      } else {
+        clearOrphanState(workspace)
+      }
+    },
+    [],
+  )
+
+  // Shared by Ctrl/Cmd+K search-insert and the toolbox pills' Enter/Space
+  // activation (the keyboard equivalent of a pointer drag): create the block
+  // and connect it to the end of the start chain.
+  const insertStepBlockAtEnd = useCallback(
+    (state: State) => {
+      const workspace = workspaceRef.current
+      if (!workspace || workspace.options.readOnly) return
+
+      Blockly.Events.setGroup(true)
+      let newBlock: Blockly.BlockSvg | undefined
+      try {
+        newBlock = Blockly.serialization.blocks.append(state, workspace, {
+          recordUndo: true,
+        }) as Blockly.BlockSvg
+
+        // Connect after the last real block in the start chain (replaces any
+        // trailing "add a step" shadow); free placement if there is no start.
+        let tail: Blockly.Block | null = findStartBlock(workspace)
+        for (;;) {
+          const next = tail?.nextConnection?.targetBlock()
+          if (next && !next.isShadow()) tail = next
+          else break
+        }
+        if (tail?.nextConnection && newBlock.previousConnection) {
+          tail.nextConnection.connect(newBlock.previousConnection)
+        }
+      } finally {
+        Blockly.Events.setGroup(false)
+      }
+
+      syncWorkspacePresentation(workspace)
+      syncHistoryState(workspace)
+
+      // Put the cursor ON the block that was just inserted. Without this the
+      // keyboard path dead-ends here: both callers are reached from a dialog,
+      // so focus is wherever it was before the dialog opened — not in the
+      // workspace. Blockly's cursor then has no focused node, which is what
+      // makes the arrow keys do nothing, leaves no visible focus ring, and
+      // stops an unfilled socket from highlighting when you reach it. The
+      // block appears, and the user is stranded next to it.
+      //
+      // focusNode also re-activates keyboard-navigation visuals: Blockly turns
+      // them on from its own arrow/move shortcuts, and none of those can fire
+      // while nothing in the workspace holds focus.
+      //
+      // Deferred a frame on purpose. Both callers run from inside a MUI dialog
+      // that is still mounted at this point — its focus trap pulls focus back
+      // into itself, so focusing synchronously here is undone before the user
+      // ever sees it. Waiting until after the dialog unmounts is what makes the
+      // arrow keys work on the block that was just inserted instead of
+      // stranding the user on the page body.
+      if (newBlock) {
+        const target = newBlock
+        requestAnimationFrame(() => {
+          if (!target.isDisposed()) Blockly.getFocusManager().focusNode(target)
+        })
+      }
+    },
+    [syncWorkspacePresentation, syncHistoryState],
+  )
+
+  const buildShadowInputs = (blockType: string) => {
+    const ghost = GHOST_INPUT_MAP[blockType]
+    if (!ghost) return undefined
+    return Object.fromEntries(
+      Object.entries(ghost)
+        .filter(([key]) => key !== '__next__')
+        .map(([name, def]) => [
+          name,
+          { shadow: { type: def.type, fields: { name: def.label } } },
+        ]),
+    )
+  }
+
+  const handleInsertBlock = useCallback(
+    (item: ShadowPickerItem) => {
+      const blockType = item.blockType
+      if (!blockType) return
+      const inputs = buildShadowInputs(blockType)
+      const hasFields = !!item.fields && Object.keys(item.fields).length > 0
+      const hasData = typeof item.data === 'string' && item.data.length > 0
+      // Same state shape as handleInsertToolboxItem below. Dropping fields/data
+      // here is what made a Saved Task inserted from the search dialog come out
+      // as an empty "Do:" with no task behind it.
+      insertStepBlockAtEnd({
+        type: blockType,
+        ...(hasFields ? { fields: item.fields } : {}),
+        ...(hasData ? { data: item.data } : {}),
+        ...(inputs ? { inputs } : {}),
+      })
+    },
+    [insertStepBlockAtEnd],
+  )
+
+  // Keyboard equivalent of dragging a toolbox pill (dragProxy.ts) onto the
+  // canvas — same state shape (fields/data for dynamic Object/Location/Skill
+  // pills included), but appended at the chain end instead of dropped at a
+  // pointer position.
+  const handleInsertToolboxItem = useCallback(
+    (item: ToolboxBlockItem) => {
+      const inputs = buildShadowInputs(item.type)
+      const hasFields = !!item.fields && Object.keys(item.fields).length > 0
+      const hasData = typeof item.data === 'string' && item.data.length > 0
+      insertStepBlockAtEnd({
+        type: item.type,
+        ...(hasFields ? { fields: item.fields } : {}),
+        ...(hasData ? { data: item.data } : {}),
+        ...(inputs ? { inputs } : {}),
+      })
+    },
+    [insertStepBlockAtEnd],
+  )
+
+  const executeDeleteAll = useCallback(
+    (workspace: Blockly.WorkspaceSvg) => {
+      Blockly.Events.setGroup(true)
+      try {
+        const startBlock = findStartBlock(workspace)
+        if (startBlock?.nextConnection?.targetBlock()) {
+          startBlock.nextConnection.disconnect()
+        }
+
+        const toDispose = workspace
+          .getAllBlocks(false)
+          .filter(
+            (b) =>
+              !b.isShadow() &&
+              !b.isInsertionMarker() &&
+              b.type !== START_BLOCK_TYPE &&
+              !b.getParent(),
+          )
+
+        for (let i = toDispose.length - 1; i >= 0; i--) {
+          if (!toDispose[i].disposed) toDispose[i].dispose(false)
+        }
+      } finally {
+        Blockly.Events.setGroup(false)
+      }
+
+      syncWorkspacePresentation(workspace)
+      syncHistoryState(workspace)
+    },
+    [syncHistoryState, syncWorkspacePresentation],
+  )
+
+  // ── Delete area registration ───────────────────────────────────────────────
+  const unregisterToolboxDeleteArea = useCallback(() => {
+    const ws = deleteAreaWorkspaceRef.current
+    const da = deleteAreaRef.current
+    if (!ws || !da) return
+    try {
+      ws.getComponentManager().removeComponent(da.id)
+      ws.recordDragTargets()
+    } catch {
+      /* component already unmounted or workspace not registered */
+    }
+    toolboxRootRef.current?.classList.remove('custom-toolbox--delete-over')
+    deleteAreaRef.current = null
+    deleteAreaWorkspaceRef.current = null
+  }, [])
+
+  const stopToolboxHoverTracking = useCallback(() => {
+    toolboxHoverTrackingCleanupRef.current?.()
+    toolboxHoverTrackingCleanupRef.current = null
+  }, [])
+
+  const startToolboxHoverTracking = useCallback(() => {
+    stopToolboxHoverTracking()
+
+    const onPointerMove = (event: PointerEvent) => {
+      const toolboxRect = toolboxRootRef.current?.getBoundingClientRect()
+      const isOverToolbox = Boolean(
+        toolboxRect &&
+        event.clientX >= toolboxRect.left &&
+        event.clientX <= toolboxRect.right &&
+        event.clientY >= toolboxRect.top &&
+        event.clientY <= toolboxRect.bottom,
+      )
+      setToolboxDeleteZoneState(isOverToolbox ? 'hover-confirm' : 'drag-intent')
+    }
+
+    window.addEventListener('pointermove', onPointerMove, true)
+    toolboxHoverTrackingCleanupRef.current = () => {
+      window.removeEventListener('pointermove', onPointerMove, true)
+    }
+  }, [stopToolboxHoverTracking])
+
+  const registerToolboxDeleteArea = useCallback(
+    (
+      workspace: Blockly.WorkspaceSvg | null,
+      toolboxElement: HTMLElement | null,
+    ) => {
+      unregisterToolboxDeleteArea()
+      if (!workspace || !toolboxElement || workspace.options.readOnly) return
+      const da = new CustomToolboxDeleteArea(toolboxElement)
+      workspace.getComponentManager().addComponent(
+        {
+          component: da,
+          capabilities: [
+            Blockly.ComponentManager.Capability.DRAG_TARGET,
+            Blockly.ComponentManager.Capability.DELETE_AREA,
+          ],
+          weight: Blockly.ComponentManager.ComponentWeight.TOOLBOX_WEIGHT,
+        },
+        true,
+      )
+      workspace.recordDragTargets()
+      deleteAreaRef.current = da
+      deleteAreaWorkspaceRef.current = workspace
+    },
+    [unregisterToolboxDeleteArea],
+  )
+
+  const detachWorkspaceListener = useCallback(() => {
+    const ws = workspaceRef.current
+    const listener = workspaceChangeListenerRef.current
+    if (ws && listener) ws.removeChangeListener(listener)
+    workspaceChangeListenerRef.current = null
+  }, [])
+
+  // ── Context menu inline-task confirmation ──────────────────────────────────
+  const handleRequestInlineTaskConfirmation =
+    useCallback<RequestInlineTaskConfirmation>(
+      (macroName, onConfirm) => {
+        if (deleteConfirmMode === 'never') {
+          onConfirm()
+          return
+        }
+        setInlineTaskConfirm({ macroName, onConfirm })
+      },
+      [deleteConfirmMode],
+    )
+
+  // ── Macro explosion ────────────────────────────────────────────────────────
+  const explodeMacro = useCallback(
+    (block: Blockly.BlockSvg, workspace: Blockly.WorkspaceSvg) => {
+      const result = expandMacroTask({
+        block,
+        workspace,
+        dataMacros: availableMacros,
+        macroDetailsById,
+        dataObjects,
+        dataLocations,
+        dataActions,
+      })
+      if (!result.ok) {
+        toast.error(result.reason)
+      }
+    },
+    [
+      availableMacros,
+      macroDetailsById,
+      dataObjects,
+      dataLocations,
+      dataActions,
+    ],
+  )
+
+  // ── Context menu bridge ────────────────────────────────────────────────────
+  useEffect(() => {
+    return installContextMenuBridge({
+      workspaceRef,
+      setContextMenu,
+      getNextOptionId: () => ++contextMenuOptionIdRef.current,
+      onExpandMacro: explodeMacro,
+      resolveMacroId: getMacroIdFromBlockData,
+      requestInlineTaskConfirmation: handleRequestInlineTaskConfirmation,
+    })
+  }, [explodeMacro, handleRequestInlineTaskConfirmation])
+
+  // ── Cleanup on unmount ─────────────────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      pendingDragCleanupRef.current?.()
+      keydownCleanupRef.current?.()
+      keydownCleanupRef.current = null
+      pendingDragCleanupRef.current = null
+      suppressDeleteZoneForNextDragRef.current = false
+      setIsDeleting(false)
+      setToolboxDeleteZoneState('idle')
+      shadowPicker.close()
+      setContextMenu(null)
+      stopToolboxHoverTracking()
+      detachWorkspaceListener()
+      unregisterToolboxDeleteArea()
+      workspaceRef.current = null
+    }
+  }, [])
+
+  // ── window.confirm monkey-patch for "Delete All" ──────────────────────────
+  // Blockly's built-in "Delete All Blocks" fires window.confirm. We intercept
+  // it to show our own React modal instead of the browser's native dialog.
+  useEffect(() => {
+    // .bind(window): window.confirm isn't declared `this: void`, so a bare
+    // reference trips @typescript-eslint/unbound-method — it's never
+    // actually called (only reassigned back on cleanup below), but bind it
+    // anyway rather than suppress the rule.
+    const originalConfirm = window.confirm.bind(window)
+
+    window.confirm = (_message?: string): boolean => {
+      const workspace = workspaceRef.current
+      const realCount = workspace
+        ? countRealBlocks(workspace.getAllBlocks(false), START_BLOCK_TYPE)
+        : 0
+
+      if (!workspace) return false
+
+      if (!shouldConfirmDelete(realCount)) {
+        executeDeleteAll(workspace)
+        return false
+      }
+
+      setConfirmDialog({
+        message: `Delete all ${realCount} block${realCount !== 1 ? 's' : ''}?`,
+        onConfirm: () => {
+          setConfirmDialog(null)
+          executeDeleteAll(workspace)
+        },
+        onCancel: () => setConfirmDialog(null),
+      })
+      return false
+    }
+
+    return () => {
+      window.confirm = originalConfirm
+    }
+  }, [executeDeleteAll, shouldConfirmDelete])
+
+  // ── Shadow picker position resolver ───────────────────────────────────────
+  const resolveShadowPickerPosition = useCallback(
+    (workspace: Blockly.WorkspaceSvg, block: Blockly.Block) => {
+      const blockSvg = block as Blockly.BlockSvg
+      const svgRoot = blockSvg.getSvgRoot?.()
+      if (svgRoot) {
+        const rect = svgRoot.getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0) {
+          return {
+            top: Math.round(rect.top + rect.height / 2),
+            left: Math.round(rect.left + rect.width / 2),
+          }
+        }
+      }
+      try {
+        const pos = block.getRelativeToSurfaceXY()
+        const size = blockSvg.getHeightWidth()
+        const center = new Blockly.utils.Coordinate(
+          pos.x + size.width / 2,
+          pos.y + size.height / 2,
+        )
+        const screen = Blockly.utils.svgMath.wsToScreenCoordinates(
+          workspace,
+          center,
+        )
+        return { top: Math.round(screen.y), left: Math.round(screen.x) }
+      } catch {
+        return {
+          top: Math.round(window.innerHeight / 2),
+          left: Math.round(window.innerWidth / 2),
+        }
+      }
+    },
+    [],
+  )
+
+  // Opening the slot picker, shared by both entry points: the pointer path
+  // (a Blockly CLICK event) and the keyboard path (the open_shadow_picker
+  // shortcut registered below). Blockly only ever fires a block CLICK from
+  // Gesture.doBlockClick() on pointerup, so before this existed the picker —
+  // the only way to say WHICH object to pick or WHERE to place it — could not
+  // be opened without a mouse at all. That made every study task impossible to
+  // build from the keyboard, a WCAG 2.1.1 (Level A) failure.
+  const openShadowPickerFor = useCallback(
+    (
+      workspace: Blockly.WorkspaceSvg,
+      block: Blockly.BlockSvg,
+      popoverType: ShadowPopoverType,
+    ) => {
+      workspace.hideChaff()
+      setContextMenu(null)
+      block.getSvgRoot?.()?.classList.add('shadow-block--selected')
+      setShadowIconState(block, true)
+      shadowPicker.open(
+        block.id,
+        popoverType,
+        resolveShadowPickerPosition(workspace, block),
+      )
+    },
+    [shadowPicker, resolveShadowPickerPosition],
+  )
+  // The shortcut is registered once, in an effect with no dependencies, so it
+  // must not close over this callback directly — same reasoning as
+  // shouldConfirmDeleteRef above.
+  const openShadowPickerForRef = useRef(openShadowPickerFor)
+  useEffect(() => {
+    openShadowPickerForRef.current = openShadowPickerFor
+  }, [openShadowPickerFor])
+
+  // Enter/Space opens the picker on a focused slot; T jumps to the React
+  // palette (Blockly's own focus_toolbox is inert here — it needs a native
+  // toolbox or flyout, and this app registers neither).
+  //
+  // Both collide with a built-in shortcut, and winning that collision is not
+  // luck: addKeyMapping() does `shortcutNames.unshift(name)`, and onKeyDown()
+  // walks the list forward stopping at the first callback returning true.
+  // Blockly registers at module-evaluation time and we register at mount, so
+  // ours are consulted first. Returning false falls through to Blockly's.
+  useEffect(() => {
+    const guards = (workspace: Blockly.WorkspaceSvg) =>
+      !workspace.isDragging() &&
+      !Blockly.DropDownDiv.isVisible() &&
+      !Blockly.WidgetDiv.isVisible() &&
+      !Blockly.getFocusManager().ephemeralFocusTaken()
+
+    return registerAppShortcuts([
+      {
+        name: APP_SHORTCUT_NAMES.openShadowPicker,
+        preconditionFn: guards,
+        callback: (workspace) => {
+          const node = Blockly.getFocusManager().getFocusedNode()
+          if (!(node instanceof Blockly.BlockSvg) || !node.isShadow())
+            return false
+          const popoverType = resolveShadowPopoverType(node.type)
+          if (!popoverType) return false
+          openShadowPickerForRef.current(workspace, node, popoverType)
+          return true
+        },
+        keyCodes: [Blockly.utils.KeyCodes.ENTER, Blockly.utils.KeyCodes.SPACE],
+        // Required on OUR shortcut: the flag checked in addKeyMapping is the
+        // one on the shortcut being registered, not on the pre-existing one.
+        allowCollision: true,
+      },
+      {
+        name: APP_SHORTCUT_NAMES.focusToolbox,
+        preconditionFn: guards,
+        callback: () => {
+          const root = toolboxRootRef.current
+          if (!root) return false
+          // Prefer the open category — landing on a collapsed header shows the
+          // user nothing. `.Mui-expanded` is MUI's own documented class.
+          const target =
+            root.querySelector<HTMLElement>(
+              '.toolbox-category__header.Mui-expanded',
+            ) ?? root.querySelector<HTMLElement>('.toolbox-category__header')
+          if (!target) return false
+          target.focus()
+          return true
+        },
+        keyCodes: [Blockly.utils.KeyCodes.T],
+        allowCollision: true,
+      },
+    ])
+  }, [])
+
+  // Dev-only: warn if the help dialog documents a Blockly shortcut that the
+  // bundled version no longer registers. package.json pins ^13.4.0, so the
+  // version can move on a plain `npm install`.
+  useEffect(() => warnOnShortcutDrift(), [])
+
+  // ── Task loaded callback ───────────────────────────────────────────────────
+  const handleTaskLoaded = useCallback(() => {
+    taskLoadedRef.current = true
+    const workspace = workspaceRef.current
+    if (!workspace) return
+
+    syncStartBlockVisibility(workspace, showStartBlock)
+    syncWorkspacePresentation(workspace)
+  }, [showStartBlock, syncWorkspacePresentation])
+
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace || !taskLoadedRef.current) return
+    syncWorkspacePresentation(workspace)
+  }, [blockViewMode, syncWorkspacePresentation])
+
+  // Advanced view toggles (grid / snap) → re-apply presentation.
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace || !taskLoadedRef.current) return
+    syncWorkspacePresentation(workspace)
+  }, [
+    viewSettings?.gridVisible,
+    viewSettings?.snapToGrid,
+    syncWorkspacePresentation,
+  ])
+
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace || !taskLoadedRef.current) return
+
+    syncStartBlockVisibility(workspace, showStartBlock)
+    syncWorkspacePresentation(workspace)
+  }, [showStartBlock, syncWorkspacePresentation])
+
+  // ── Workspace ready callback ───────────────────────────────────────────────
+  // This is the main workspace lifecycle hook. It attaches the change listener
+  // that drives drag highlighting, shadow-block click handling, orphan sync,
+  // history sync, and structure change propagation.
+  const handleWorkspaceReady = useCallback(
+    (workspace: Blockly.WorkspaceSvg | null) => {
+      detachWorkspaceListener()
+      unregisterToolboxDeleteArea()
+      stopToolboxHoverTracking()
+      workspaceRef.current = workspace
+      onWorkspaceReady?.(workspace)
+
+      if (!workspace) {
+        taskLoadedRef.current = false
+        suppressDeleteZoneForNextDragRef.current = false
+        setIsDeleting(false)
+        setToolboxDeleteZoneState('idle')
+        shadowPicker.close()
+        syncHistoryState(null)
+        return
+      }
+
+      // Blockly draws TWO keyboard-nav focus rings from two separate CSS variables:
+      // --blockly-active-node-color outlines the focused block/field,
+      // --blockly-active-tree-color outlines the whole focused region (workspace or
+      // toolbox). Both are live at once, which shows two boxes rather than one.
+      //
+      // The region ring is switched off: once the node ring says which block you are
+      // on, a second box around the entire workspace adds no information and reads as a
+      // rendering fault.
+      //
+      // The node ring is the selection amber, not the brand indigo: indigo means "the
+      // robot is executing this block" (block--executing) and must not also mean "you
+      // are here". Amber matches the stroke Blockly hardcodes for
+      // `.blocklySelected > .blocklyPath`, which no theme option reaches — matching it
+      // makes the mouse and the arrow keys agree on one colour.
+      //
+      // Set inline on the injection div rather than in editor.css: a stylesheet
+      // override races against Blockly's own injected <style> and loses, while an
+      // inline style wins regardless of injection order.
+      workspace
+        .getInjectionDiv()
+        .style.setProperty('--blockly-active-node-color', editorState.selection)
+      workspace
+        .getInjectionDiv()
+        .style.setProperty('--blockly-active-tree-color', 'transparent')
+
+      // ── Shadow block helpers (local to this workspace instance) ────────────
+
+      const getShadowBlocks = (ws: Blockly.WorkspaceSvg): Blockly.BlockSvg[] =>
+        ws.getAllBlocks(false).filter((b) => b.isShadow())
+
+      const getDescendantIds = (block: Blockly.Block): Set<string> => {
+        const ids = new Set<string>()
+        const queue = [...block.getChildren(false)]
+        while (queue.length > 0) {
+          const child = queue.pop()!
+          ids.add(child.id)
+          queue.push(...child.getChildren(false))
+        }
+        return ids
+      }
+
+      const highlightCompatibleShadowBlocks = (
+        ws: Blockly.WorkspaceSvg,
+        draggedBlock: Blockly.Block,
+        draggedBlockId: string,
+      ) => {
+        const checker = ws.connectionChecker
+        const excludedIds = getDescendantIds(draggedBlock)
+        excludedIds.add(draggedBlockId)
+        getShadowBlocks(ws).forEach((block) => {
+          if (excludedIds.has(block.id)) return
+          const shadowConn =
+            block.outputConnection ?? block.previousConnection ?? null
+          if (!shadowConn) return
+          const parentConn = shadowConn.targetConnection
+          if (!parentConn) return
+          const draggedConn =
+            draggedBlock.outputConnection ??
+            draggedBlock.previousConnection ??
+            null
+          if (!draggedConn) return
+          const compatible = checker.doTypeChecks(draggedConn, parentConn)
+          const svgRoot = block.getSvgRoot?.()
+          if (!svgRoot) return
+          svgRoot.classList.toggle('shadow-block--drag-target', compatible)
+          setShadowIconState(block, compatible)
+        })
+      }
+
+      const clearShadowBlockHighlights = (ws: Blockly.WorkspaceSvg) => {
+        getShadowBlocks(ws).forEach((block) => {
+          const svgRoot = block.getSvgRoot?.()
+          if (!svgRoot) return
+          svgRoot.classList.remove(
+            'shadow-block--drag-target',
+            'shadow-block--drag-incompatible',
+          )
+          setShadowIconState(block, false)
+        })
+      }
+
+      // ── Main workspace event listener ──────────────────────────────────────
+      const listener = (event: Blockly.Events.Abstract) => {
+        if (event.type === Blockly.Events.BLOCK_DELETE) {
+          syncStartBlockVisibility(workspace, showStartBlockRef.current)
+          stopToolboxHoverTracking()
+          setIsDeleting(false)
+          setToolboxDeleteZoneState('idle')
+          deleteAreaRef.current?.reset()
+          clearShadowBlockHighlights(workspace)
+        }
+
+        // Drag start / end: toggle "delete zone" mode and shadow highlighting
+        if (event.type === Blockly.Events.BLOCK_DRAG) {
+          const dragEvent = event as Blockly.Events.Abstract & {
+            isStart?: boolean
+          }
+          if (dragEvent.isStart === true) {
+            lastDragGroupRef.current =
+              event.group || Blockly.utils.idGenerator.genUid()
+            lastDragEndTimeRef.current = 0
+
+            const selected = Blockly.common.getSelected?.()
+            const selectedBlockId =
+              selected instanceof Blockly.BlockSvg ? selected.id : undefined
+            const draggedBlockId =
+              ((event as any).blockId as string | undefined) ?? selectedBlockId
+            const draggedBlock = draggedBlockId
+              ? workspace.getBlockById(draggedBlockId)
+              : null
+            const isToolboxOriginDrag = suppressDeleteZoneForNextDragRef.current
+            if (isToolboxOriginDrag) {
+              suppressDeleteZoneForNextDragRef.current = false
+            }
+
+            // Only show delete zone if dragging from workspace (not from toolbox)
+            if (
+              draggedBlock &&
+              !draggedBlock.isInFlyout &&
+              !isToolboxOriginDrag
+            ) {
+              setIsDeleting(true)
+              setToolboxDeleteZoneState('drag-intent')
+              startToolboxHoverTracking()
+              deleteAreaRef.current?.setActiveDragGroup(
+                lastDragGroupRef.current,
+              )
+            }
+
+            if (draggedBlock && draggedBlockId)
+              highlightCompatibleShadowBlocks(
+                workspace,
+                draggedBlock,
+                draggedBlockId,
+              )
+          } else if (dragEvent.isStart === false) {
+            lastDragEndTimeRef.current = Date.now()
+            suppressDeleteZoneForNextDragRef.current = false
+            stopToolboxHoverTracking()
+            setIsDeleting(false)
+            setToolboxDeleteZoneState('idle')
+            clearShadowBlockHighlights(workspace)
+            deleteAreaRef.current?.reset()
+            if (taskLoadedRef.current) {
+              syncWorkspacePresentation(workspace)
+            }
+          }
+        }
+
+        // Retroactively unify drag-group IDs for the undo stack so that a drag
+        // from the custom toolbox (which fires create + move events separately)
+        // can be undone in a single step.
+        if (
+          ['move', 'drag', 'delete', 'create', 'change'].includes(
+            `${event.type}`,
+          ) &&
+          !(event as any).group &&
+          lastDragGroupRef.current &&
+          lastDragEndTimeRef.current > 0 &&
+          Date.now() - lastDragEndTimeRef.current < 300
+        ) {
+          const undoStack = workspace.getUndoStack()
+          if (undoStack.length > 0) {
+            const top = undoStack[
+              undoStack.length - 1
+            ] as Blockly.Events.Abstract & {
+              group: string
+            }
+            if (!top.group) top.group = lastDragGroupRef.current
+          }
+        }
+
+        // Shadow block click: open the picker
+        if (`${event.type}` === `${Blockly.Events.CLICK}`) {
+          if (workspace.options.readOnly) {
+            shadowPicker.close()
+            return
+          }
+          const clickEvent = event as Blockly.Events.Click & {
+            blockId?: string
+          }
+          if (!clickEvent.blockId) {
+            shadowPicker.close()
+            return
+          }
+          const clickedBlock = workspace.getBlockById(clickEvent.blockId)
+          if (!clickedBlock || !clickedBlock.isShadow()) {
+            shadowPicker.close()
+            return
+          }
+          const nextPopoverType = resolveShadowPopoverType(clickedBlock.type)
+          if (!nextPopoverType) {
+            shadowPicker.close()
+            return
+          }
+          openShadowPickerForRef.current(
+            workspace,
+            clickedBlock,
+            nextPopoverType,
+          )
+          return
+        }
+
+        if (ORPHAN_SYNC_TYPES.has(event.type)) {
+          if (taskLoadedRef.current) {
+            syncWorkspacePresentation(workspace)
+          }
+        }
+
+        syncHistoryState(workspace)
+
+        if (STRUCTURE_CHANGING_TYPES.has(event.type)) {
+          if (onTaskStructureChangeRef.current) {
+            const structure = getBlocklyStructure()
+            const abstract = blocklyToAbstractAll(
+              structure as CustomBlock[] | null,
+            )
+            onTaskStructureChangeRef.current(abstract)
+          }
+        }
+      }
+
+      workspace.addChangeListener(listener)
+      workspaceChangeListenerRef.current = listener
+
+      // Keyboard Delete/Backspace: show confirmation modal before multi-block delete
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key !== 'Delete' && e.key !== 'Backspace') return
+        const active = document.activeElement
+        if (!active) return
+
+        // Never steal Backspace from someone who is typing: erasing a
+        // character in a block's description asked to delete the whole block.
+        // Worse here than for the other shortcut, because this handler runs in
+        // the CAPTURE phase — ahead of both Blockly and the input's own default
+        // behaviour — so it has to be the conservative one.
+        if (isTypingContext()) return
+
+        // Where the DOM focus is and where the SELECTION is are different things in
+        // Blockly. Clicking a block selects it without moving focus: the pointer gesture
+        // ends on an SVG element that is not focusable, so activeElement stays on
+        // whatever had it — often <body>, or after a drag from the palette the palette
+        // pill, a React element outside the injection div. The block is visibly
+        // selected, Delete is pressed, and nothing happens; Blockly's own Delete shortcut
+        // needs workspace focus too, so there is no fallback behind it.
+        //
+        // `document.body` (or nothing focused) is the case that has to pass: there is no
+        // focused control to steal the key from, and the selected block below is the only
+        // thing the key could mean. A focused control OUTSIDE the workspace still wins —
+        // isTypingContext above has already let every text field through, and this keeps
+        // the rest.
+        const nothingFocused = active === document.body
+        const isInsideWorkspace = Array.from(
+          document.querySelectorAll('.injectionDiv'),
+        ).some((div) => div === active || div.contains(active))
+        if (!isInsideWorkspace && !nothingFocused) return
+        const selected = Blockly.common.getSelected?.()
+        if (!selected || !(selected instanceof Blockly.BlockSvg)) return
+        if (selected.isShadow()) return
+        if (selected.type === START_BLOCK_TYPE) return
+        // getOwnBodyDescendants already drops shadows and insertion markers.
+        const totalCount = 1 + getOwnBodyDescendants(selected).length
+
+        // Always take the deletion over from Blockly, whether or not we ask first.
+        // Blockly's own Delete shortcut runs checkAndDelete(), the cascade that orphans
+        // value-input children (see disposeBlockWithBody); gating the takeover on
+        // shouldConfirmDelete would run that buggy path in silence in the default
+        // single-block case. Whether to ASK is a separate question, answered just below.
+        e.preventDefault()
+        e.stopImmediatePropagation()
+
+        const deleteNow = () => {
+          disposeBlockWithBody(selected)
+          syncHistoryState(workspace)
+        }
+
+        if (!shouldConfirmDeleteRef.current(totalCount)) {
+          deleteNow()
+          return
+        }
+        setConfirmDialog({
+          message: `Delete ${totalCount} blocks?`,
+          onConfirm: () => {
+            setConfirmDialog(null)
+            deleteNow()
+          },
+          onCancel: () => setConfirmDialog(null),
+        })
+      }
+
+      document.addEventListener('keydown', handleKeyDown, { capture: true })
+      keydownCleanupRef.current = () =>
+        document.removeEventListener('keydown', handleKeyDown, {
+          capture: true,
+        })
+
+      syncHistoryState(workspace)
+      registerToolboxDeleteArea(workspace, toolboxRootRef.current)
+    },
+    [
+      detachWorkspaceListener,
+      unregisterToolboxDeleteArea,
+      registerToolboxDeleteArea,
+      startToolboxHoverTracking,
+      stopToolboxHoverTracking,
+      syncHistoryState,
+      shadowPicker,
+      onWorkspaceReady,
+      syncWorkspacePresentation,
+    ],
+  )
+
+  // ── Toolbox root ref callback ──────────────────────────────────────────────
+  const handleToolboxRootRefChange = useCallback(
+    (element: HTMLElement | null) => {
+      toolboxRootRef.current = element
+      registerToolboxDeleteArea(workspaceRef.current, element)
+    },
+    [registerToolboxDeleteArea],
+  )
+
+  // ── Undo / Redo ────────────────────────────────────────────────────────────
+
+  // Undo or redo one user action. A single action can span several Blockly
+  // events that share a `group` id (e.g. create + connect), so we step the
+  // whole top group. Symmetric by construction — undo and redo run the same
+  // routine with `redo` flipped. Ghost placeholders never reach the history
+  // stacks (injected under Events.disable, restored via a recordUndo=false
+  // synthetic change), so there is no ghost-restore special-casing to do.
+  const stepHistory = useCallback(
+    (redo: boolean) => {
+      const workspace = workspaceRef.current
+      if (!workspace) return
+      const stack = redo ? workspace.getRedoStack() : workspace.getUndoStack()
+      if (stack.length === 0) return
+
+      // One call is enough: Blockly's own Workspace.undo() already drains the whole
+      // event group in a single step (it pops while the next event shares the group id
+      // of the first), so no follow-up loop is needed.
+      workspace.undo(redo)
+      syncHistoryState(workspace)
+    },
+    [syncHistoryState],
+  )
+
+  const handleUndo = useCallback(() => stepHistory(false), [stepHistory])
+  const handleRedo = useCallback(() => stepHistory(true), [stepHistory])
+
+  // ── Zoom controls ──────────────────────────────────────────────────────────
+  const handleZoomIn = useCallback(
+    () => workspaceRef.current?.zoomCenter(1),
+    [],
+  )
+  const handleZoomOut = useCallback(
+    () => workspaceRef.current?.zoomCenter(-1),
+    [],
+  )
+  const handleZoomToFit = useCallback(
+    () => workspaceRef.current?.zoomToFit(),
+    [],
+  )
+
+  // ── Context menu ───────────────────────────────────────────────────────────
+  const handleCloseContextMenu = useCallback(() => setContextMenu(null), [])
+
+  const handleContextMenuItemClick = useCallback(
+    (option: ContextMenuAction) => {
+      const currentMenu = contextMenu
+      setContextMenu(null)
+      if (typeof option?.callback !== 'function') return
+
+      const label = getMenuOptionText(option.text).toLowerCase()
+      const isDelete =
+        label.includes('delete') ||
+        label.includes('remove') ||
+        label.includes('elimina')
+
+      if (isDelete && currentMenu?.blockId) {
+        const workspace = workspaceRef.current
+        const block = workspace?.getBlockById(currentMenu.blockId)
+        if (
+          block instanceof Blockly.BlockSvg &&
+          !block.isShadow() &&
+          block.type !== START_BLOCK_TYPE
+        ) {
+          const totalCount = 1 + getOwnBodyDescendants(block).length
+
+          // Run our own deletion instead of Blockly's option.callback(), always
+          // — not only when we ask first. Blockly's blockDelete callback is
+          // `focusNode(block); block.checkAndDelete()`, and checkAndDelete is
+          // the cascade that orphans value-input children. We keep the
+          // focusNode part (it is what gives the deletion a sane focus
+          // context) and replace the cascade.
+          const deleteNow = () => {
+            Blockly.getFocusManager().focusNode(block)
+            disposeBlockWithBody(block)
+          }
+
+          if (!shouldConfirmDelete(totalCount)) {
+            deleteNow()
+            return
+          }
+          setConfirmDialog({
+            message: `Delete ${totalCount} blocks?`,
+            onConfirm: () => {
+              setConfirmDialog(null)
+              deleteNow()
+            },
+            onCancel: () => setConfirmDialog(null),
+          })
+          return
+        }
+      }
+
+      window.setTimeout(() => option.callback(), 50)
+    },
+    [contextMenu, shouldConfirmDelete],
+  )
+
+  // ── Toolbox block drag initiator ───────────────────────────────────────────
+  const handleBlockPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, item: ToolboxBlockItem) => {
+      if (e.button !== 0) return
+      const workspace = workspaceRef.current
+      if (!workspace || workspace.options.readOnly) return
+      e.preventDefault()
+      workspace.hideChaff()
+      pendingDragCleanupRef.current?.()
+      pendingDragCleanupRef.current = null
+
+      const startX = e.clientX
+      const startY = e.clientY
+      const pointerId = e.pointerId
+      const sourceElement = e.currentTarget
+      // A press that never becomes a drag is a click, and a click has to add
+      // the block.
+      //
+      // It did not. The pill carries role="button" and the label "Add <block>
+      // to the task", and Enter/Space on it call handleInsertToolboxItem — so
+      // the keyboard had a one-press path to add a block and the mouse had
+      // none. Pressing a pill and releasing without moving did nothing at all,
+      // as did dragging and releasing before the pointer reached the canvas.
+      // Meanwhile every instruction in the app ("Drag blocks into workspace",
+      // "Drag a block from the toolbox to start") taught the one interaction
+      // that novices fail at most in a block editor, because it was the only
+      // one a mouse had.
+      //
+      // Tracked rather than recomputed on pointerup: the release can land back
+      // within the threshold after a wide excursion, and that gesture is an
+      // abandoned drag, not a click.
+      let movedPastThreshold = false
+
+      const cleanup = () => {
+        window.removeEventListener('pointermove', onPointerMove)
+        window.removeEventListener('pointerup', onPointerEnd)
+        window.removeEventListener('pointercancel', onPointerEnd)
+        if (pendingDragCleanupRef.current === cleanup)
+          pendingDragCleanupRef.current = null
+      }
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId) return
+        const distance = Math.hypot(
+          moveEvent.clientX - startX,
+          moveEvent.clientY - startY,
+        )
+        if (distance < DRAG_THRESHOLD_PX) return
+        movedPastThreshold = true
+
+        // Wait until the pointer is actually over the canvas before creating
+        // the block.
+        //
+        // The 5px threshold alone fires while the pointer is still inside the
+        // toolbox column, which sits to the LEFT of the injection div. The
+        // block is then created at a negative workspace coordinate — measured
+        // at x=-95 with the pointer at 110 and the canvas starting at 253 — and
+        // Blockly scrolls the workspace to bring that off-canvas block into
+        // view. The scroll moves the canvas out from under the stationary
+        // cursor, so the block ends up displaced by exactly the scroll amount
+        // (measured: 93px scroll, 93px of unexplained gap).
+        //
+        // Requiring the pointer to be inside the canvas keeps the initial
+        // coordinate on-screen, so there is nothing for Blockly to scroll to
+        // and the block starts where the cursor is. The pill stays "picked up"
+        // until then — the drag simply materialises on entering the canvas.
+        const canvas = workspace.getInjectionDiv().getBoundingClientRect()
+        const insideCanvas =
+          moveEvent.clientX >= canvas.left &&
+          moveEvent.clientX <= canvas.right &&
+          moveEvent.clientY >= canvas.top &&
+          moveEvent.clientY <= canvas.bottom
+        if (!insideCanvas) return
+
+        suppressDeleteZoneForNextDragRef.current = true
+        window.dispatchEvent(new Event('toolboxDragStart'))
+        cleanup()
+        startSyntheticBlockDrag(moveEvent, sourceElement, item, workspace)
+      }
+
+      const onPointerEnd = (endEvent: PointerEvent) => {
+        if (endEvent.pointerId !== pointerId) return
+        cleanup()
+        if (endEvent.type === 'pointerup' && !movedPastThreshold) {
+          handleInsertToolboxItem(item)
+        }
+      }
+
+      window.addEventListener('pointermove', onPointerMove)
+      window.addEventListener('pointerup', onPointerEnd)
+      window.addEventListener('pointercancel', onPointerEnd)
+      pendingDragCleanupRef.current = cleanup
+    },
+    [handleInsertToolboxItem],
+  )
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  return (
+    <div
+      className={[
+        'custom-dragdrop-layout',
+        `workspace-view--${blockViewMode}`,
+        showStartBlock ? 'workspace-start--visible' : 'workspace-start--hidden',
+      ].join(' ')}
+    >
+      <a href="#blocklyDiv" className="skip-to-workspace">
+        Skip to blocks workspace
+      </a>
+      {/* Stays mounted while collapsed so its width can animate shut, same
+          pattern as the nav rail (MiniDrawerStyled) — unmounting on toggle
+          gave the toolbox no transition at all, just an instant swap. */}
+      <CustomToolbox
+        collapsed={!!viewSettings?.toolboxCollapsed}
+        dataObjects={dataObjects}
+        dataLocations={dataLocations}
+        dataActions={dataActions}
+        dataMacros={availableMacros}
+        isDeleting={isDeleting}
+        deleteZoneState={toolboxDeleteZoneState}
+        blockViewMode={blockViewMode}
+        showLogicOperators={!!viewSettings?.showLogicOperators}
+        onRootRefChange={handleToolboxRootRefChange}
+        onCollapse={
+          onViewSettingsChange
+            ? () => onViewSettingsChange({ toolboxCollapsed: true })
+            : undefined
+        }
+        onBlockPointerDown={handleBlockPointerDown}
+        onBlockActivate={handleInsertToolboxItem}
+        macroDetailsById={macroDetailsById}
+      />
+      <div
+        className="custom-dragdrop-workspace-wrapper"
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        <BlocklyWorkspace
+          dataTask={dataTask}
+          editMode={editMode}
+          pendingExternalTask={pendingExternalTask}
+          applyExternalTaskState={applyExternalTaskState}
+          onExternalTaskStateApplied={onExternalTaskStateApplied}
+          onWorkspaceReady={handleWorkspaceReady}
+          onTaskLoaded={handleTaskLoaded}
+        />
+
+        {/* Workspace controls overlay: undo/redo + zoom */}
+        <div className="workspace-controls-overlay">
+          {/* "Show toolbox" lives here only while hidden; the "hide" button
+              lives inside the toolbox header. */}
+          {onViewSettingsChange && viewSettings?.toolboxCollapsed && (
+            <div className="workspace-controls-group workspace-controls-group--top-left">
+              <Tooltip title="Show toolbox">
+                <IconButton
+                  className="workspace-control-button"
+                  size="small"
+                  onClick={() =>
+                    onViewSettingsChange({ toolboxCollapsed: false })
+                  }
+                  aria-label="Show toolbox"
+                >
+                  <PanelLeft size={18} />
+                </IconButton>
+              </Tooltip>
+            </div>
+          )}
+          <div className="workspace-controls-group workspace-controls-group--top-right">
+            <Tooltip
+              title={
+                <Stack
+                  direction="row"
+                  spacing={0.5}
+                  sx={{ alignItems: 'center' }}
+                >
+                  <span>Undo</span>
+                  <KeycapHint
+                    sx={{
+                      bgcolor: 'transparent',
+                      borderColor: 'rgba(255,255,255,0.3)',
+                      color: 'common.white',
+                    }}
+                  >
+                    {modKey()}Z
+                  </KeycapHint>
+                </Stack>
+              }
+            >
+              <span>
+                <IconButton
+                  className="workspace-control-button"
+                  size="small"
+                  onClick={handleUndo}
+                  disabled={!historyState.canUndo}
+                  aria-label="Undo"
+                >
+                  <Undo2 size={18} />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip
+              title={
+                <Stack
+                  direction="row"
+                  spacing={0.5}
+                  sx={{ alignItems: 'center' }}
+                >
+                  <span>Redo</span>
+                  <KeycapHint
+                    sx={{
+                      bgcolor: 'transparent',
+                      borderColor: 'rgba(255,255,255,0.3)',
+                      color: 'common.white',
+                    }}
+                  >
+                    {modKey()}⇧Z
+                  </KeycapHint>
+                </Stack>
+              }
+            >
+              <span>
+                <IconButton
+                  className="workspace-control-button"
+                  size="small"
+                  onClick={handleRedo}
+                  disabled={!historyState.canRedo}
+                  aria-label="Redo"
+                >
+                  <Redo2 size={18} />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <span className="workspace-controls-divider" aria-hidden="true" />
+            {/* Out of the ⋯ menu and onto the bar.
+                It is the one click-to-add path the palette does not offer, and
+                it sat inside an overflow menu at the same level as "Export
+                task" — so the alternative to dragging was behind three dots.
+                Kept in the ⋯ menu as well: the menu row carries the ⌘K hint,
+                which is how anyone learns the shortcut exists. */}
+            <Tooltip
+              title={
+                <Stack
+                  direction="row"
+                  spacing={0.5}
+                  sx={{ alignItems: 'center' }}
+                >
+                  <span>Add a step</span>
+                  <KeycapHint
+                    sx={{
+                      bgcolor: 'transparent',
+                      borderColor: 'rgba(255,255,255,0.3)',
+                      color: 'common.white',
+                    }}
+                  >
+                    {ADD_BLOCK_SHORTCUT}
+                  </KeycapHint>
+                </Stack>
+              }
+            >
+              <IconButton
+                className="workspace-control-button"
+                size="small"
+                onClick={() => setBlockSearchOpen(true)}
+                aria-label="Add a step"
+              >
+                <Search size={18} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="More actions">
+              <IconButton
+                className="workspace-control-button"
+                size="small"
+                onClick={(e) => setMoreMenuAnchorEl(e.currentTarget)}
+                aria-label="More actions"
+              >
+                <MoreHorizontal size={18} />
+              </IconButton>
+            </Tooltip>
+            {onViewSettingsChange && viewSettings && (
+              <Tooltip title="Workspace settings">
+                <IconButton
+                  className="workspace-control-button"
+                  size="small"
+                  onClick={handleOpenSettings}
+                  aria-label="Workspace Settings"
+                >
+                  <Settings size={18} />
+                </IconButton>
+              </Tooltip>
+            )}
+          </div>
+          <div className="workspace-controls-group workspace-controls-group--bottom-right">
+            <IconButton
+              className="workspace-control-button"
+              size="small"
+              onClick={handleZoomIn}
+              aria-label="Zoom in"
+            >
+              <Plus size={18} />
+            </IconButton>
+            <IconButton
+              className="workspace-control-button"
+              size="small"
+              onClick={handleZoomOut}
+              aria-label="Zoom out"
+            >
+              <Minus size={18} />
+            </IconButton>
+            <IconButton
+              className="workspace-control-button"
+              size="small"
+              onClick={handleZoomToFit}
+              aria-label="Fit to screen"
+            >
+              <Maximize size={18} />
+            </IconButton>
+          </div>
+        </div>
+
+        {/* Shadow block picker — opened when user clicks a "+" shadow block */}
+        <ShadowPickerMenu
+          isOpen={shadowPicker.isOpen}
+          position={shadowPicker.position}
+          popoverType={shadowPicker.popoverType}
+          groupedItems={shadowPicker.groupedItems}
+          filteredItems={shadowPicker.filteredItems}
+          searchQuery={shadowPicker.searchQuery}
+          onSearchChange={shadowPicker.setSearchQuery}
+          onSelect={shadowPicker.selectItem}
+          onClose={shadowPicker.close}
+        />
+
+        {/* Context menu — opened via right-click on a block */}
+        <Menu
+          open={contextMenu !== null}
+          onClose={handleCloseContextMenu}
+          anchorReference="anchorPosition"
+          anchorPosition={
+            contextMenu
+              ? { top: contextMenu.mouseY, left: contextMenu.mouseX }
+              : undefined
+          }
+          transformOrigin={{ vertical: 'top', horizontal: 'left' }}
+          slotProps={{
+            paper: {
+              elevation: 0,
+              sx: {
+                ...MENU_PAPER_SX,
+                mt: 0.5,
+                p: 0.5,
+                minWidth: 220,
+              },
+            },
+            list: { dense: true, sx: { p: 0 } },
+          }}
+        >
+          {(contextMenu?.options ?? []).map((entry, idx) => {
+            if ('separator' in entry && entry.separator) {
+              return (
+                <Divider
+                  key={`sep-${idx}`}
+                  sx={{ my: 0.5, mx: 0.5, borderColor: 'divider' }}
+                />
+              )
+            }
+            const option = entry as ContextMenuAction
+            const label = getMenuOptionText(option.text)
+            const { Icon, color } = getMenuIconInfo(label)
+            const isDisabled = option.enabled === false
+            return (
+              <MenuItem
+                key={option.id}
+                disabled={isDisabled}
+                onClick={() => handleContextMenuItemClick(option)}
+                sx={{
+                  mx: 0.5,
+                  my: 0.25,
+                  minHeight: 38,
+                  borderRadius: 1.5,
+                  px: 1,
+                }}
+              >
+                <ListItemIcon
+                  sx={{
+                    minWidth: 30,
+                    color: isDisabled ? 'text.disabled' : color,
+                  }}
+                >
+                  <Icon size={16} strokeWidth={2.1} />
+                </ListItemIcon>
+                <ListItemText
+                  primary={label}
+                  slotProps={{
+                    primary: {
+                      sx: {
+                        fontSize: 14,
+                        fontWeight: 500,
+                        color: isDisabled ? 'text.disabled' : 'text.primary',
+                      },
+                    },
+                  }}
+                />
+              </MenuItem>
+            )
+          })}
+        </Menu>
+
+        {/* Break into steps confirmation dialog */}
+        {inlineTaskConfirm && (
+          <InlineTaskDialog
+            open
+            macroName={inlineTaskConfirm.macroName}
+            onConfirm={() => {
+              inlineTaskConfirm.onConfirm()
+              setInlineTaskConfirm(null)
+            }}
+            onCancel={() => setInlineTaskConfirm(null)}
+          />
+        )}
+
+        {/* Generic delete confirmation dialog */}
+        {confirmDialog && (
+          <ConfirmDialog
+            open
+            message={confirmDialog.message}
+            onConfirm={confirmDialog.onConfirm}
+            onCancel={confirmDialog.onCancel}
+            confirmLabel={confirmDialog.confirmLabel}
+          />
+        )}
+
+        <KeyboardHelpDialog
+          open={keyboardHelpOpen}
+          onClose={() => setKeyboardHelpOpen(false)}
+        />
+
+        <BlockSearchDialog
+          open={blockSearchOpen}
+          onClose={() => setBlockSearchOpen(false)}
+          onInsert={handleInsertBlock}
+          macros={availableMacros}
+        />
+
+        {/* Hidden file input for Import — triggered from the ⋯ More menu. */}
+        <input
+          ref={importFileInputRef}
+          type="file"
+          accept=".json,application/json"
+          hidden
+          onChange={handleImportFile}
+        />
+
+        {/* ⋯ More: one-shot actions, kept separate from settings/preferences. */}
+        <Menu
+          anchorEl={moreMenuAnchorEl}
+          open={isMoreMenuOpen}
+          onClose={closeMoreMenu}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+          transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+          slotProps={{
+            paper: {
+              elevation: 0,
+              sx: { ...MENU_PAPER_SX, mt: 0.5, minWidth: 220 },
+            },
+          }}
+        >
+          <MenuItem
+            onClick={() => {
+              closeMoreMenu()
+              setBlockSearchOpen(true)
+            }}
+          >
+            <ListItemIcon>
+              <Search size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Add a step" />
+            <KeycapHint sx={{ ml: 3 }}>{ADD_BLOCK_SHORTCUT}</KeycapHint>
+          </MenuItem>
+          {/* Same wording and icons as the single-block options in the
+              right-click menu (LABEL_MAP / getMenuIconInfo in contextMenu.ts):
+              one concept, one name. "Collapse"/"Expand" is Blockly's
+              vocabulary, not the app's. */}
+          <MenuItem
+            disabled={!collapseState.canCollapse}
+            onClick={() => {
+              closeMoreMenu()
+              handleCollapseAll(true)
+            }}
+          >
+            <ListItemIcon>
+              <Minimize2 size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Compact all" />
+          </MenuItem>
+          <MenuItem
+            disabled={!collapseState.canExpand}
+            onClick={() => {
+              closeMoreMenu()
+              handleCollapseAll(false)
+            }}
+          >
+            <ListItemIcon>
+              <Maximize2 size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Show all details" />
+          </MenuItem>
+          <Divider />
+          <MenuItem
+            onClick={() => {
+              closeMoreMenu()
+              handleExportTask()
+            }}
+          >
+            <ListItemIcon>
+              <Download size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Export task" />
+          </MenuItem>
+          <MenuItem
+            onClick={() => {
+              closeMoreMenu()
+              importFileInputRef.current?.click()
+            }}
+          >
+            <ListItemIcon>
+              <Upload size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Import task" />
+          </MenuItem>
+          <Divider />
+          <MenuItem
+            onClick={() => {
+              closeMoreMenu()
+              setKeyboardHelpOpen(true)
+            }}
+          >
+            <ListItemIcon>
+              <Keyboard size={16} />
+            </ListItemIcon>
+            <ListItemText primary="Keyboard shortcuts" />
+          </MenuItem>
+        </Menu>
+
+        {/* Workspace settings popover */}
+        {onViewSettingsChange && viewSettings && (
+          <Popover
+            open={isSettingsOpen}
+            anchorEl={settingsAnchorEl}
+            onClose={handleCloseSettings}
+            anchorOrigin={{
+              vertical: 'bottom',
+              horizontal: 'right',
+            }}
+            transformOrigin={{
+              vertical: 'top',
+              horizontal: 'right',
+            }}
+            slotProps={{
+              paper: {
+                elevation: 0,
+                sx: {
+                  ...MENU_PAPER_SX,
+                  p: 2.5,
+                  mt: 1,
+                  width: 320,
+                },
+              },
+            }}
+          >
+            <Stack spacing={2.5}>
+              <Box>
+                <Typography
+                  variant="h6"
+                  sx={{ fontSize: 15, fontWeight: 700, color: 'text.primary' }}
+                >
+                  Workspace Settings
+                </Typography>
+                <Typography
+                  variant="caption"
+                  sx={{ color: 'text.secondary', display: 'block', mt: 0.5 }}
+                >
+                  Editor preferences.
+                </Typography>
+              </Box>
+
+              <Typography
+                variant="subtitle2"
+                sx={{ fontWeight: 700, fontSize: 13, color: 'text.primary' }}
+              >
+                Display
+              </Typography>
+
+              <Box>
+                <Typography
+                  variant="subtitle2"
+                  sx={{
+                    mb: 1,
+                    fontWeight: 650,
+                    fontSize: 13,
+                    color: 'text.primary',
+                  }}
+                >
+                  Block detail
+                </Typography>
+                <SegmentedControl
+                  exclusive
+                  fullWidth
+                  aria-label="Block detail"
+                  value={viewSettings.blockViewMode}
+                  onChange={(_e, val) =>
+                    val && onViewSettingsChange({ blockViewMode: val })
+                  }
+                  options={[
+                    { value: 'complete', label: 'Complete' },
+                    { value: 'essential', label: 'Essential' },
+                    { value: 'minimal', label: 'Minimal' },
+                  ]}
+                />
+                <Typography
+                  sx={{ mt: 0.5, fontSize: 11, color: 'text.secondary' }}
+                >
+                  How much text shows on each block — Complete shows icons and
+                  filled-in values, Essential drops the icons, Minimal drops
+                  both.
+                </Typography>
+              </Box>
+
+              <SettingSwitch
+                label="Show grid"
+                checked={viewSettings.gridVisible}
+                onChange={(value) =>
+                  onViewSettingsChange({ gridVisible: value })
+                }
+              />
+
+              <SettingSwitch
+                label="Snap to grid"
+                checked={viewSettings.snapToGrid}
+                onChange={(value) =>
+                  onViewSettingsChange({ snapToGrid: value })
+                }
+              />
+
+              <SettingSwitch
+                label="Follow the running step"
+                caption="Scrolls to the step the robot is on, but only when it has gone off-screen."
+                checked={viewSettings.followRunningBlock}
+                onChange={(value) =>
+                  onViewSettingsChange({ followRunningBlock: value })
+                }
+              />
+
+              <SettingSwitch
+                label="Condition operators"
+                caption="Adds AND, OR and NOT to Conditions, for combining two events in one step."
+                checked={viewSettings.showLogicOperators}
+                onChange={(value) =>
+                  onViewSettingsChange({ showLogicOperators: value })
+                }
+              />
+
+              <SettingSwitch
+                label="Show start block"
+                caption="Hiding the start block also stops highlighting steps that aren't connected to the program."
+                checked={viewSettings.showStartBlock}
+                onChange={(value) =>
+                  onViewSettingsChange({ showStartBlock: value })
+                }
+              />
+
+              <Divider />
+
+              <Typography
+                variant="subtitle2"
+                sx={{ fontWeight: 700, fontSize: 13, color: 'text.primary' }}
+              >
+                Behavior & Accessibility
+              </Typography>
+
+              <Box>
+                <Typography
+                  variant="subtitle2"
+                  sx={{
+                    mb: 1,
+                    fontWeight: 650,
+                    fontSize: 13,
+                    color: 'text.primary',
+                  }}
+                >
+                  Delete confirmations
+                </Typography>
+                <SegmentedControl
+                  exclusive
+                  fullWidth
+                  aria-label="Delete confirmations"
+                  value={viewSettings.deleteConfirmMode}
+                  onChange={(_e, val) =>
+                    val && onViewSettingsChange({ deleteConfirmMode: val })
+                  }
+                  options={[
+                    { value: 'always', label: 'Always' },
+                    { value: 'multiple', label: 'Multiple' },
+                    { value: 'never', label: 'Never' },
+                  ]}
+                />
+                <Typography
+                  sx={{ mt: 0.5, fontSize: 11, color: 'text.secondary' }}
+                >
+                  When deleting asks for confirmation — Always for every block,
+                  Multiple only when it takes more than one block with it, Never
+                  skips the confirmation.
+                </Typography>
+              </Box>
+
+              <SettingSwitch
+                label="Keyboard mode"
+                caption="Always show the keyboard cursor (for keyboard / screen-reader use)."
+                checked={viewSettings.keyboardMode}
+                onChange={(value) =>
+                  onViewSettingsChange({ keyboardMode: value })
+                }
+              />
+
+              {onResetViewSettings && (
+                <Button
+                  variant="outlined"
+                  size="small"
+                  onClick={onResetViewSettings}
+                  fullWidth
+                  sx={{ borderRadius: 2, fontSize: 12 }}
+                >
+                  Restore Defaults
+                </Button>
+              )}
+            </Stack>
+          </Popover>
+        )}
+      </div>
+    </div>
+  )
+}

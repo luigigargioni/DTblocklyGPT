@@ -12,15 +12,20 @@ export type AnalyzerIssue = {
   stepPath: (number | string)[] // Path to the step in the steps tree
 }
 
+/** Returns an object by id from the task object catalog. */
 const findObject = (objects: AbstractObject[] | undefined, id: number) => {
   return objects?.find((obj) => obj.id === id)
 }
+
+/** Returns a location by id from the task location catalog. */
 const findLocation = (
   locations: AbstractLocation[] | undefined,
   id: number,
 ) => {
   return locations?.find((loc) => loc.id === id)
 }
+
+/** Returns an action by id from the task action catalog. */
 const findAction = (actions: AbstractAction[] | undefined, id: number) => {
   return actions?.find((act) => act.id === id)
 }
@@ -53,7 +58,7 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
         issues.push({
           type: 'error',
           message:
-            'Robot attempting to pick while already holding an object (missing intermediate place)',
+            'This step tries to pick up an object while already holding one — add a Place step first.',
           stepPath: currentPath,
         })
       }
@@ -63,7 +68,7 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
         issues.push({
           type: 'error',
           message:
-            'Robot attempting to place but not holding an object (missing intermediate pick)',
+            "This step tries to place an object, but nothing's been picked up yet — add a Pick step first.",
           stepPath: currentPath,
         })
       }
@@ -72,7 +77,8 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
       if (step.type === 'when' && !step.condition) {
         issues.push({
           type: 'error',
-          message: 'When block is missing a condition',
+          message:
+            'This condition step has no condition set — choose one (gesture, voice command, object, etc.).',
           stepPath: currentPath,
         })
       }
@@ -87,11 +93,12 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
 
       // Check for object existence and properties in pick (using state before update)
       if (step.type === 'pick') {
-        const obj = findObject(objects, step.objectId)
+        const obj = findObject(objects, Number(step.objectId))
         if (!obj) {
           issues.push({
             type: 'error',
-            message: `Object with id '${step.objectId}' not found`,
+            message:
+              'This step picks an object that no longer exists in the library — pick a different one.',
             stepPath: currentPath,
           })
         } else {
@@ -103,7 +110,7 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
           ) {
             issues.push({
               type: 'error',
-              message: `Object '${obj.name}' (weight ${obj.weight}) exceeds robot max load (${robot.max_load})`,
+              message: `'${obj.name}' is too heavy for this robot (${obj.weight}g, max ${robot.max_load}g).`,
               stepPath: currentPath,
             })
           }
@@ -114,7 +121,7 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
             if (dimensions.some((dim) => dim && dim > maxOpenArm)) {
               issues.push({
                 type: 'error',
-                message: `Object '${obj.name}' (dimensions ${dimensions.join('x')}) exceeds robot max open arm (${maxOpenArm})`,
+                message: `'${obj.name}' is too wide for this robot's gripper to hold.`,
                 stepPath: currentPath,
               })
             }
@@ -123,22 +130,24 @@ export const analyzeAbstractTask = (task: AbstractTask): AnalyzerIssue[] => {
       }
       // Check for location existence and properties in place (using state before update)
       if (step.type === 'place') {
-        const loc = findLocation(locations, step.locationId)
+        const loc = findLocation(locations, Number(step.locationId))
         if (!loc) {
           issues.push({
             type: 'error',
-            message: `Location with id '${step.locationId}' not found`,
+            message:
+              'This step places at a location that no longer exists in the library — pick a different one.',
             stepPath: currentPath,
           })
         }
       }
       // Check for action existence in processing (using state before update)
       if (step.type === 'processing') {
-        const act = findAction(actions, step.actionId)
+        const act = findAction(actions, Number(step.actionId))
         if (!act) {
           issues.push({
             type: 'error',
-            message: `Action with id '${step.actionId}' not found`,
+            message:
+              'This step runs a skill that no longer exists in the library — pick a different one.',
             stepPath: currentPath,
           })
         }

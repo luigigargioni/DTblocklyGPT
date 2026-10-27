@@ -1,92 +1,99 @@
-import React from 'react'
+import React, { useCallback, useState } from 'react'
 import {
   Button,
   Checkbox,
   Divider,
   FormControlLabel,
   FormHelperText,
-  Grid,
   Stack,
   TextField,
 } from '@mui/material'
+import { ArrowUpRight } from 'lucide-react'
 import { Formik } from 'formik'
 import { toast } from 'react-toastify'
 import { string as YupString, object as YupObject } from 'yup'
-import { useNavigate, useSearchParams } from 'react-router-dom'
-import { BuildOutlined } from '@ant-design/icons'
+import { useNavigate } from 'react-router-dom'
 import { useDispatch } from 'react-redux'
 
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
-import { activeItem, openDrawer } from 'store/reducers/menu'
-import { Collapse } from 'antd'
-import { TaskDetailType } from './types'
+import { activeItem } from 'store/reducers/menu'
+import { TaskStatusChip } from 'components/TaskStatusChip'
 
-export enum TypeNewTask {
-  CHAT = 'chat',
-  GRAPHIC = 'graphic',
-  MULTIMODAL = 'multimodal',
-}
+import { TaskDetailType, TaskStatus } from './types'
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface FormTaskProps {
-  data: TaskDetailType | undefined
-  insertMode: boolean
+  data: TaskDetailType
   backFunction: () => void
 }
 
-export const FormTask = ({ data, insertMode, backFunction }: FormTaskProps) => {
+interface SaveTaskResponse {
+  nameAlreadyExists?: boolean
+  id?: number
+}
+
+type FormValues = Omit<TaskDetailType, 'code'> & {
+  code: Record<string, unknown> | null
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+// This form only ever edits an existing task — every "New Task" flow creates
+// the task directly in the Blockly workspace (`/task/new`) and metadata gets
+// filled in here afterwards. The publish/save-draft/discard lifecycle lives
+// on the workspace's own header (Save & Publish, Discard draft), which is
+// where the task's blocks are actually visible — not duplicated here.
+export const FormTask = ({ data, backFunction }: FormTaskProps) => {
   const navigate = useNavigate()
   const dispatch = useDispatch()
-  const [searchParams] = useSearchParams()
-  const type = searchParams.get('type')
+  const [isSaving, setIsSaving] = useState(false)
 
-  const onSubmit = async (
-    values: TaskDetailType,
-    { setStatus, setSubmitting, setFieldError, setFieldTouched },
-  ) => {
-    const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
-    fetchApi({ url: endpoints.home.libraries.task, method, body: values })
-      .then(async (res) => {
-        if (res && res.nameAlreadyExists) {
+  const onSubmit = useCallback(
+    async (
+      values: FormValues,
+      { setStatus, setFieldError, setFieldTouched },
+    ) => {
+      setIsSaving(true)
+      try {
+        const res = await fetchApi<SaveTaskResponse, FormValues>({
+          url: endpoints.home.libraries.task,
+          method: MethodHTTP.PUT,
+          body: values,
+        })
+        if (res?.nameAlreadyExists) {
           await setFieldTouched('name', true)
           await setFieldError('name', MessageText.alreadyExists)
           setStatus({ success: false })
           return
         }
-        const newTaskId = insertMode ? res.id : null
         setStatus({ success: true })
-        if (!type) toast.success(MessageText.success)
-        if (type === TypeNewTask.CHAT) {
-          dispatch(openDrawer(false))
-          navigate(`/chat/${newTaskId}`)
-          return
-        }
-        if (type === TypeNewTask.GRAPHIC) {
-          dispatch(openDrawer(false))
-          navigate(`/graphic/${newTaskId}?newTask=true`)
-          return
-        }
-        if (type === TypeNewTask.MULTIMODAL) {
-          dispatch(openDrawer(false))
-          navigate(`/multimodal/${newTaskId}?newTask=true`)
-          return
-        }
+        toast.success(MessageText.success)
         backFunction()
-      })
-      .finally(() => {
-        setSubmitting(false)
-      })
-  }
+      } finally {
+        setIsSaving(false)
+      }
+    },
+    [backFunction],
+  )
+
+  const currentStatus: TaskStatus = data.status ?? 'draft'
 
   return (
-    <Formik
+    <Formik<FormValues>
       initialValues={{
-        id: data?.id || -1,
-        name: data?.name || '',
-        description: data?.description || '',
-        code: data?.code || '',
-        shared: data?.shared || false,
+        id: data.id,
+        name: data.name ?? '',
+        description: data.description ?? '',
+        code: data.code ?? null,
+        shared: data.shared ?? false,
+        owner: data.owner,
+        owner__username: data.owner__username,
+        task_type: data.task_type ?? 'task',
+        status: data.status ?? 'draft',
+        signature: data.signature ?? '',
       }}
       validationSchema={YupObject().shape({
         name: YupString()
@@ -100,127 +107,105 @@ export const FormTask = ({ data, insertMode, backFunction }: FormTaskProps) => {
         handleBlur,
         handleChange,
         handleSubmit,
-        isSubmitting,
         touched,
         values,
         setFieldValue,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
-          <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
-            {!insertMode && (
-              <Grid size={1}>
-                <Stack spacing={1}>
-                  <Button
-                    onClick={() => {
-                      dispatch(openDrawer(false))
-                      dispatch(activeItem('definegraphic'))
-                      navigate(`/graphic/${values.id}`)
-                    }}
-                    color="primary"
-                    aria-label="detail"
-                    size="medium"
-                    title="Go to graphic interface"
-                    startIcon={<BuildOutlined style={{ fontSize: '2em' }} />}
-                  >
-                    Graphic
-                  </Button>
-                </Stack>
-              </Grid>
-            )}
-            <Grid size={insertMode ? 3 : 2}>
-              <Stack spacing={1}>
-                <TextField
-                  id="name"
-                  value={values.name || ''}
-                  name="name"
-                  label="Name"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  error={Boolean(touched.name && errors.name)}
-                  title="Name of the task"
-                />
-                {touched.name && errors.name && (
-                  <FormHelperText error id="helper-text-name">
-                    {errors.name}
-                  </FormHelperText>
-                )}
-              </Stack>
-            </Grid>
-            <Grid size={8}>
-              <Stack spacing={1}>
-                <TextField
-                  id="description"
-                  value={values.description || ''}
-                  name="description"
-                  label="Description"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  title="Description of the task"
-                />
-              </Stack>
-            </Grid>
-            <Grid size={1}>
-              <Stack spacing={1}>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      id="shared"
-                      value={values.shared}
-                      name="shared"
-                      onBlur={handleBlur}
-                      onChange={() => setFieldValue('shared', !values.shared)}
-                      checked={values.shared}
-                    />
-                  }
-                  title="Share this task with other users"
-                  label="Shared"
-                />
-              </Stack>
-            </Grid>
-            <Divider />
-            {!insertMode && (
-              <Grid size={12}>
-                <Stack spacing={1}>
-                  <Collapse
-                    key="task-collapse-debug"
-                    items={[
-                      {
-                        label: 'Task JSON',
-                        key: 'task-json',
-                        children: (
-                          <pre>
-                            {values.code
-                              ? JSON.stringify(JSON.parse(values.code), null, 2)
-                              : ''}
-                          </pre>
-                        ),
-                      },
-                    ]}
-                  />
-                </Stack>
-              </Grid>
-            )}
-            <Grid size={12}>
+        <form noValidate onSubmit={handleSubmit}>
+          <Stack spacing={2.5}>
+            <Stack
+              direction="row"
+              spacing={1.5}
+              sx={{ alignItems: 'center', flexWrap: 'wrap' }}
+            >
+              <TaskStatusChip status={currentStatus} />
               <Button
-                disableElevation
-                disabled={isSubmitting}
-                fullWidth
-                size="large"
-                type="submit"
-                variant="contained"
-                color="primary"
-                title="Save task"
+                onClick={() => {
+                  dispatch(activeItem('tasks'))
+                  navigate(`/task/${values.id}`)
+                }}
+                size="small"
+                variant="text"
+                title="Open the blocks for this task"
+                endIcon={<ArrowUpRight size={14} />}
+                sx={{ textTransform: 'none', fontWeight: 500 }}
               >
-                Save
+                Open in workspace
               </Button>
-            </Grid>
-          </Grid>
+            </Stack>
+
+            <Divider />
+
+            <Stack spacing={1}>
+              <TextField
+                id="name"
+                value={values.name}
+                name="name"
+                label="Name"
+                required
+                onBlur={handleBlur}
+                onChange={handleChange}
+                error={Boolean(touched.name && errors.name)}
+                aria-invalid={Boolean(touched.name && errors.name)}
+                aria-describedby={
+                  touched.name && errors.name ? 'helper-text-name' : undefined
+                }
+                title="Name of the task"
+                fullWidth
+              />
+              {touched.name && errors.name && (
+                <FormHelperText error role="alert" id="helper-text-name">
+                  {errors.name}
+                </FormHelperText>
+              )}
+            </Stack>
+
+            <TextField
+              id="description"
+              value={values.description}
+              name="description"
+              label="Description"
+              onBlur={handleBlur}
+              onChange={handleChange}
+              title="Description of the task"
+              fullWidth
+              multiline
+              minRows={2}
+            />
+
+            <FormControlLabel
+              control={
+                <Checkbox
+                  id="shared"
+                  value={values.shared}
+                  name="shared"
+                  onBlur={handleBlur}
+                  onChange={() => setFieldValue('shared', !values.shared)}
+                  checked={values.shared}
+                />
+              }
+              title="Share this task with other users"
+              label="Shared — visible to other users"
+            />
+
+            <Button
+              disableElevation
+              disabled={isSaving}
+              fullWidth
+              size="large"
+              type="submit"
+              variant="contained"
+              color="primary"
+              title="Save task"
+              sx={{
+                borderRadius: '8px',
+                textTransform: 'none',
+                fontWeight: 600,
+              }}
+            >
+              Save
+            </Button>
+          </Stack>
         </form>
       )}
     </Formik>

@@ -1,5 +1,20 @@
+/**
+ * locations, including the taught pose a place step drives to
+ *
+ * One of six sibling CRUD forms (pages/{objects,actions,locations,robots,users,myrobots}/form*.tsx)
+ * that all share the same shape: Formik state + a yup schema, submitted through
+ * `fetchApi` from services/api.ts.
+ *
+ * The one part that is not boilerplate is the duplicate-name branch. `fetchApi`
+ * RESOLVES on 400/409 instead of rejecting (see the LANDMINE comment in
+ * services/api.ts), so a name collision arrives as a normal `.then()` carrying
+ * a flag in the payload — never as a `.catch()`. These forms therefore inspect
+ * the response body and push the error onto the field with `setFieldError`.
+ * Reading the collision from a rejected promise would silently never fire.
+ */
 import React from 'react'
 import {
+  Alert,
   Button,
   Checkbox,
   Chip,
@@ -17,102 +32,163 @@ import {
   TextField,
 } from '@mui/material'
 import { Formik } from 'formik'
+import type { FormikHelpers } from 'formik'
 import { toast } from 'react-toastify'
 import { string as YupString, object as YupObject } from 'yup'
-import { AimOutlined, PlusOutlined } from '@ant-design/icons'
+import { Crosshair, Plus } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
 import { MyRobotType } from 'pages/myrobots/types'
-import { useSearchParams } from 'react-router-dom'
-import { LocationDetailType } from './types'
+
+import { LocationDetailType, CartesianPositionType } from './types'
+
+/** "X: 120mm · Y: 45mm · Z: 200mm" — readable stand-in for the raw
+ * {X,Y,Z,RX,RY,RZ,FIG} JSON an operator has no reason to parse by eye. */
+const formatPositionSummary = (raw: string): string | null => {
+  try {
+    const p = JSON.parse(raw) as Partial<CartesianPositionType>
+    if (
+      typeof p.X !== 'number' ||
+      typeof p.Y !== 'number' ||
+      typeof p.Z !== 'number'
+    ) {
+      return null
+    }
+    return `X: ${Math.round(p.X)}mm · Y: ${Math.round(p.Y)}mm · Z: ${Math.round(p.Z)}mm`
+  } catch {
+    return null
+  }
+}
 
 interface FormLocationProps {
   dataLocation: LocationDetailType | undefined
   dataMyRobots: MyRobotType[]
   insertMode: boolean
   backFunction: () => void
+  readOnly?: boolean
+  ownerUsername?: string
 }
+
+interface LocationFormValues extends Omit<LocationDetailType, 'position'> {
+  position: string | null
+  robot: number | '' | null
+}
+
+interface SaveLocationResponse {
+  nameAlreadyExists?: boolean
+  keywordExist?: boolean
+  keywordFound?: string[]
+}
+
+interface GetJointPositionResponse {
+  position?: unknown
+}
+
+type SetFieldValue = FormikHelpers<LocationFormValues>['setFieldValue']
+type SetFieldError = FormikHelpers<LocationFormValues>['setFieldError']
+type SetFieldTouched = FormikHelpers<LocationFormValues>['setFieldTouched']
 
 export const FormLocation = ({
   dataLocation,
   dataMyRobots,
   insertMode,
   backFunction,
+  readOnly = false,
+  ownerUsername,
 }: FormLocationProps) => {
   const [searchParams] = useSearchParams()
   const [addKeyword, setAddKeyword] = React.useState<string>('')
   const [keywordErrors, setKeywordErrors] = React.useState<string[]>([])
+  const [showRawPosition, setShowRawPosition] = React.useState(false)
   const forcedName = searchParams.get('forcedName')
 
-  const onSubmit = async (
-    values: LocationDetailType,
-    { setStatus, setSubmitting, setFieldError, setFieldTouched },
+  const onSubmit = (
+    values: LocationFormValues,
+    {
+      setStatus,
+      setSubmitting,
+      setFieldError,
+      setFieldTouched,
+    }: FormikHelpers<LocationFormValues>,
   ) => {
+    if (readOnly) return
     const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
     setKeywordErrors([])
-    fetchApi({ url: endpoints.home.libraries.location, method, body: values })
-      .then(async (res) => {
-        if (res && res.nameAlreadyExists) {
-          await setFieldTouched('name', true)
-          await setFieldError('name', MessageText.alreadyExists)
+    void fetchApi<SaveLocationResponse, LocationFormValues>({
+      url: endpoints.home.libraries.location,
+      method,
+      body: values,
+    })
+      .then((res) => {
+        if (res?.nameAlreadyExists) {
+          void setFieldTouched('name', true)
+          setFieldError('name', MessageText.alreadyExists)
           setStatus({ success: false })
           return
         }
-        if (res && res.keywordExist) {
-          setKeywordErrors(res.keywordFound)
+
+        if (res?.keywordExist) {
+          setKeywordErrors(
+            Array.isArray(res.keywordFound) ? res.keywordFound : [],
+          )
           setStatus({ success: false })
           return
         }
+
         setStatus({ success: true })
         toast.success(MessageText.success)
         backFunction()
+      })
+      .catch(() => {
+        setStatus({ success: false })
       })
       .finally(() => {
         setSubmitting(false)
       })
   }
 
-  const handleGetPosition = async (
-    robot: number | null,
-    setFieldValue: (field: string, value: any) => void,
-    setFieldError: (field: string, value: any) => void,
-    setFieldTouched: (field: string, touched: any) => void,
+  const handleGetPosition = (
+    robot: LocationFormValues['robot'],
+    setFieldValue: SetFieldValue,
+    setFieldError: SetFieldError,
+    setFieldTouched: SetFieldTouched,
   ) => {
     if (!robot) {
-      await setFieldTouched('robot', true)
-      await setFieldError('robot', MessageText.requiredField)
+      void setFieldTouched('robot', true)
+      setFieldError('robot', MessageText.requiredField)
       return
     }
 
-    // Mock data
-    /*
-    const newPoint =
-      '{"X": 0, "Y": 0, "Z": 0, "RX": 0, "RY": 0, "RZ": 0, "FIG": 0}'
-    setFieldValue('position', newPoint)
-    toast.success('Position acquired')
-    */
-
-    fetchApi({
+    void fetchApi<GetJointPositionResponse, { robot: number }>({
       url: endpoints.home.libraries.getJointPosition,
       method: MethodHTTP.POST,
-      body: { robot },
-    }).then((response) => {
-      if (response) {
-        setFieldValue('position', JSON.stringify(response.position))
-        toast.success('Position acquired')
-      }
+      body: { robot: Number(robot) },
     })
+      .then((response) => {
+        if (response?.position) {
+          void setFieldValue('position', JSON.stringify(response.position))
+          toast.success('Position acquired')
+        }
+      })
+      .catch(() => {
+        // fetchApi already surfaces a toast for the failure.
+      })
   }
 
   return (
-    <Formik
+    <Formik<LocationFormValues>
       initialValues={{
         id: dataLocation?.id || -1,
         name: forcedName || dataLocation?.name || '',
         shared: dataLocation?.shared || false,
-        position: dataLocation?.position || null,
+        owner: dataLocation?.owner ?? -1,
+        owner__username: dataLocation?.owner__username ?? '',
+        position: dataLocation?.position
+          ? JSON.stringify(dataLocation.position)
+          : null,
         robot: null,
         keywords: dataLocation?.keywords || [],
       }}
@@ -135,14 +211,15 @@ export const FormLocation = ({
         setFieldError,
         setFieldTouched,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
+        <form noValidate onSubmit={handleSubmit}>
           <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
+            {readOnly && (
+              <Grid size={12}>
+                <Alert severity="info">
+                  Shared by {ownerUsername ?? 'another user'} — read-only
+                </Alert>
+              </Grid>
+            )}
             <Grid size={2}>
               <Stack spacing={1}>
                 <TextField
@@ -150,14 +227,19 @@ export const FormLocation = ({
                   value={values.name || ''}
                   name="name"
                   label="Name"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
-                  disabled={!!forcedName}
+                  disabled={!!forcedName || readOnly}
                   error={Boolean(touched.name && errors.name)}
+                  aria-invalid={Boolean(touched.name && errors.name)}
+                  aria-describedby={
+                    touched.name && errors.name ? 'helper-text-name' : undefined
+                  }
                   title="Name of the location"
                 />
                 {touched.name && errors.name && (
-                  <FormHelperText error id="helper-text-name">
+                  <FormHelperText error role="alert" id="helper-text-name">
                     {errors.name}
                   </FormHelperText>
                 )}
@@ -172,8 +254,11 @@ export const FormLocation = ({
                       value={values.shared}
                       name="shared"
                       onBlur={handleBlur}
-                      onChange={() => setFieldValue('shared', !values.shared)}
+                      onChange={() => {
+                        void setFieldValue('shared', !values.shared)
+                      }}
                       checked={values.shared}
+                      disabled={readOnly}
                     />
                   }
                   label="Shared"
@@ -192,13 +277,15 @@ export const FormLocation = ({
                   name="add_keyword"
                   label="Add keyword"
                   title="You can define keywords for this grid to be used as synonyms during the chat"
+                  disabled={readOnly}
                   onChange={(e) => setAddKeyword(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
+                      e.preventDefault()
                       if (addKeyword) {
                         const newKeywords = [...values.keywords]
                         newKeywords.push(addKeyword)
-                        setFieldValue('keywords', newKeywords)
+                        void setFieldValue('keywords', newKeywords)
                         setAddKeyword('')
                       }
                     }
@@ -212,17 +299,19 @@ export const FormLocation = ({
                               if (addKeyword) {
                                 const newKeywords = [...values.keywords]
                                 newKeywords.push(addKeyword)
-                                setFieldValue('keywords', newKeywords)
+                                void setFieldValue('keywords', newKeywords)
                                 setAddKeyword('')
                               }
                             }}
                             disabled={
+                              readOnly ||
                               !addKeyword ||
                               values.keywords.includes(addKeyword)
                             }
                             edge="end"
+                            aria-label="Add keyword"
                           >
-                            <PlusOutlined />
+                            <Plus size={16} />
                           </IconButton>
                         </InputAdornment>
                       ),
@@ -238,16 +327,20 @@ export const FormLocation = ({
                     key={keyword}
                     label={keyword}
                     variant="outlined"
-                    onDelete={() => {
-                      const newKeywords = [...values.keywords]
-                      newKeywords.splice(index, 1)
-                      setFieldValue('keywords', newKeywords)
+                    onDelete={
+                      readOnly
+                        ? undefined
+                        : () => {
+                            const newKeywords = [...values.keywords]
+                            newKeywords.splice(index, 1)
+                            void setFieldValue('keywords', newKeywords)
 
-                      const newKeywordErrors = keywordErrors.filter(
-                        (keywordError) => keywordError !== keyword,
-                      )
-                      setKeywordErrors(newKeywordErrors)
-                    }}
+                            const newKeywordErrors = keywordErrors.filter(
+                              (keywordError) => keywordError !== keyword,
+                            )
+                            setKeywordErrors(newKeywordErrors)
+                          }
+                    }
                     color={
                       keywordErrors.includes(keyword) ? 'error' : 'primary'
                     }
@@ -270,11 +363,18 @@ export const FormLocation = ({
                     name="robot"
                     onBlur={handleBlur}
                     onChange={(e) => {
-                      setFieldValue('robot', e.target.value)
-                      setFieldValue('position', '')
+                      void setFieldValue('robot', e.target.value)
+                      void setFieldValue('position', '')
                     }}
+                    disabled={readOnly}
                     error={Boolean(touched.robot && errors.robot)}
-                    title="Robot use to acquire position and photo"
+                    aria-invalid={Boolean(touched.robot && errors.robot)}
+                    aria-describedby={
+                      touched.robot && errors.robot
+                        ? 'helper-text-robot'
+                        : undefined
+                    }
+                    title="Robot used to acquire position and photo"
                   >
                     {dataMyRobots?.map((myRobot) => (
                       <MenuItem value={myRobot.id} key={myRobot.id}>
@@ -283,7 +383,7 @@ export const FormLocation = ({
                     ))}
                   </Select>
                   {touched.robot && errors.robot && (
-                    <FormHelperText error id="helper-text-robot">
+                    <FormHelperText error role="alert" id="helper-text-robot">
                       {errors.robot}
                     </FormHelperText>
                   )}
@@ -305,8 +405,9 @@ export const FormLocation = ({
                   aria-label="detail"
                   size="medium"
                   variant="outlined"
+                  disabled={readOnly}
                   title="Acquire the position of the location"
-                  startIcon={<AimOutlined style={{ fontSize: '2em' }} />}
+                  startIcon={<Crosshair size={20} />}
                 >
                   Get position
                 </Button>
@@ -314,19 +415,42 @@ export const FormLocation = ({
             </Grid>
             <Grid size={8}>
               <Stack spacing={1}>
-                <TextField
-                  id="position"
-                  value={values.position || ''}
-                  name="position"
-                  label="Position"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  disabled
-                  error={Boolean(touched.position && errors.position)}
-                  title="Position acquired from the robot"
-                />
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ alignItems: 'flex-end' }}
+                >
+                  <TextField
+                    id="position"
+                    value={
+                      values.position &&
+                      !showRawPosition &&
+                      formatPositionSummary(values.position)
+                        ? formatPositionSummary(values.position)
+                        : values.position || ''
+                    }
+                    name="position"
+                    label="Position"
+                    onBlur={handleBlur}
+                    onChange={handleChange}
+                    disabled
+                    error={Boolean(touched.position && errors.position)}
+                    title="Position acquired from the robot"
+                    fullWidth
+                  />
+                  {values.position &&
+                    formatPositionSummary(values.position) && (
+                      <Button
+                        size="small"
+                        onClick={() => setShowRawPosition((v) => !v)}
+                        sx={{ whiteSpace: 'nowrap', mb: 0.5 }}
+                      >
+                        {showRawPosition ? 'Summary' : 'Raw data'}
+                      </Button>
+                    )}
+                </Stack>
                 {touched.position && errors.position && (
-                  <FormHelperText error id="helper-text-position">
+                  <FormHelperText error role="alert" id="helper-text-position">
                     {errors.position}
                   </FormHelperText>
                 )}
@@ -335,13 +459,17 @@ export const FormLocation = ({
             <Grid size={12}>
               <Button
                 disableElevation
-                disabled={isSubmitting}
+                disabled={isSubmitting || readOnly}
                 fullWidth
                 size="large"
                 type="submit"
                 variant="contained"
                 color="primary"
-                title="Save this location"
+                title={
+                  readOnly
+                    ? "Shared by another user — you can't edit this"
+                    : 'Save this location'
+                }
               >
                 Save
               </Button>

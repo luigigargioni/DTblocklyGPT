@@ -1,0 +1,1059 @@
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react'
+import {
+  useParams,
+  useNavigate,
+  useSearchParams,
+  useLocation,
+} from 'react-router-dom'
+import { useDispatch } from 'react-redux'
+import { Box, CircularProgress, Typography } from '@mui/material'
+import { useTheme } from '@mui/material/styles'
+import useSWR, { useSWRConfig } from 'swr'
+import dayjs from 'dayjs'
+import { toast } from 'react-toastify'
+import * as Blockly from 'blockly/core'
+import { Blocks } from 'lucide-react'
+
+import { useAppSelector } from 'store/reducers'
+import {
+  setActiveTask,
+  setSaving,
+  setDiscarding,
+  setLastSaved,
+  triggerSave,
+  triggerRename,
+  triggerDiscard,
+  triggerSavedFlash,
+  setSaveError,
+  setWorkspaceReady,
+  setConformanceIssues,
+  setHasUnsavedEdits,
+  toggleChat,
+  toggleSim,
+} from 'store/reducers/task'
+import { resetSimulation } from 'store/reducers/simulation'
+import { openDrawer } from 'store/reducers/menu'
+import { BlocklyEditor, getBlocklyStructure } from 'features/blockly'
+import { useViewSettings } from 'features/blockly/utils/useViewSettings'
+import { useConformance } from 'features/blockly/utils/useConformance'
+import {
+  abstractToBlockly,
+  blocklyToAbstractAll,
+  CustomBlock,
+} from 'utils/blocklyParser'
+import { endpoints } from 'services/endpoints'
+import { fetchApi, MethodHTTP } from 'services/api'
+import { ObjectListType } from 'pages/objects/types'
+import { LocationListType } from 'pages/locations/types'
+import { ActionListType } from 'pages/actions/types'
+import {
+  TaskType,
+  TaskDetailType,
+  AbstractStep,
+  TaskStatus,
+} from 'pages/tasks/types'
+import { BlockState as State } from 'utils/blocklyTypes'
+import { isBlocklyPayload } from 'utils/blocklyPayload'
+import { isModalOpen, isTypingInTextControl } from 'utils/keyboardGuards'
+import { useDocumentTitle } from 'hooks/useDocumentTitle'
+import { getFromLocalStorage, LocalStorageKey } from 'utils/localStorageUtils'
+
+import { ChatThread } from '../../components/ChatThread'
+import { DigitalTwinPanel } from '../../components/DigitalTwinPanel'
+import { BottomPanel } from '../../components/BottomPanel'
+import { StatusBar } from '../../components/StatusBar'
+
+const isBlockState = (value: unknown): value is State =>
+  typeof value === 'object' &&
+  value !== null &&
+  'type' in value &&
+  typeof (value as { type?: unknown }).type === 'string'
+
+/**
+ * Shared empty result for SWR queries that have not resolved yet. One frozen
+ * instance so the "no data" case keeps a stable identity across renders — see
+ * the comment on the queries below for what an inline `[]` cost here.
+ */
+const NO_ROWS: never[] = Object.freeze([]) as never[]
+
+const UnifiedWorkspace = () => {
+  const theme = useTheme()
+  const { id } = useParams()
+  const navigate = useNavigate()
+  const dispatch = useDispatch()
+  const location = useLocation()
+  const { mutate } = useSWRConfig()
+  const [searchParams] = useSearchParams()
+  const typeParam = searchParams.get('type')
+  // The Tasks list "Run on the real robot" button lands here with this state
+  // instead of a query param — it's a one-shot instruction, not a bookmarkable
+  // URL, so it's consumed once and doesn't need to survive a refresh.
+  const navState = location.state as {
+    autoOpenRobot?: boolean
+    executionTarget?: 'sim' | 'real'
+  } | null
+  // Set when this page created the task row itself. The blocks on screen are
+  // then the source of truth, not what the server echoes back a moment later.
+  const [createdHereId, setCreatedHereId] = useState<string | null>(null)
+  const isCreatedHere = createdHereId !== null && createdHereId === id
+  const initialExecutionTarget = navState?.executionTarget
+
+  // Redux layout/sync states
+  const chatOpen = useAppSelector((state) => state.task.chatOpen)
+  const simOpen = useAppSelector((state) => state.task.simOpen)
+  // Read here, not only inside the panel: the workspace has to reserve exactly
+  // as much room as the panel takes, or the panel overlaps it.
+  const robotPanelWidth = useAppSelector((state) => state.task.robotPanelWidth)
+  const codeOpen = useAppSelector((state) => state.task.codeOpen)
+  const activeTaskName = useAppSelector((state) => state.task.activeTaskName)
+  const activeTaskDescription = useAppSelector(
+    (state) => state.task.activeTaskDescription,
+  )
+  useDocumentTitle(activeTaskName || 'Task')
+  const activeTaskStatus = useAppSelector(
+    (state) => state.task.activeTaskStatus,
+  )
+  const isSaving = useAppSelector((state) => state.task.isSaving)
+  const saveTriggered = useAppSelector((state) => state.task.saveTriggered)
+  const discardTriggered = useAppSelector(
+    (state) => state.task.discardTriggered,
+  )
+  const renameTriggered = useAppSelector((state) => state.task.renameTriggered)
+  const isReadOnly = useAppSelector((state) => state.task.isReadOnly)
+  const chatPosition =
+    useAppSelector((state) => state.task.chatPosition) || 'right'
+
+  // Same source/shape as listTasks.tsx's canManage — one place per-file that
+  // reads the logged-in user's id from localStorage, kept in sync deliberately.
+  const storedUser: unknown = getFromLocalStorage(LocalStorageKey.USER)
+  const currentUserId =
+    typeof storedUser === 'object' &&
+    storedUser !== null &&
+    'id' in storedUser &&
+    (typeof storedUser.id === 'string' || typeof storedUser.id === 'number')
+      ? String(storedUser.id)
+      : null
+
+  // Sync chat sidebar visibility based on homepage URL query parameters
+  useEffect(() => {
+    if (typeParam === 'graphic') {
+      if (chatOpen) {
+        dispatch(toggleChat())
+      }
+    } else if (typeParam === 'chat' || typeParam === 'multimodal') {
+      if (!chatOpen) {
+        dispatch(toggleChat())
+      }
+    }
+  }, [typeParam, chatOpen, dispatch])
+
+  // Sync the robot panel to this visit's intent, once per mount. simOpen is
+  // a single global Redux flag with no per-task scope, so without this it
+  // leaks open from whichever task it was last toggled on into the next
+  // workspace you visit (including a brand-new task) — open only on the
+  // explicit "Run on the real robot" card action, force closed otherwise.
+  // Guarded by a ref, not just a simOpen check, so closing the panel
+  // afterwards doesn't reopen/reclose it on an unrelated re-render.
+  const autoOpenRobotHandledRef = useRef(false)
+  useEffect(() => {
+    if (autoOpenRobotHandledRef.current) return
+    autoOpenRobotHandledRef.current = true
+    const shouldBeOpen = !!navState?.autoOpenRobot
+    if (simOpen !== shouldBeOpen) dispatch(toggleSim())
+    // simulation is likewise a single global slice with no per-task scope —
+    // without this, navigating away mid-run and opening a different task
+    // inherits isRunning/message from whatever ran on the last one.
+    dispatch(resetSimulation())
+    // eslint-disable-next-line @eslint-react/exhaustive-deps
+  }, [])
+
+  // Blockly View Settings
+  const { viewSettings, updateViewSettings, resetViewSettings } =
+    useViewSettings()
+
+  // Focus mode: collapse the nav rail and the Blockly toolbox while a run is
+  // in flight, then restore exactly what was open before. Ref-guarded so a
+  // re-render mid-run doesn't re-snapshot an already-collapsed layout.
+  const drawerOpen = useAppSelector((state) => state.menu.drawerOpen)
+  const isSimulationRunning = useAppSelector(
+    (state) => state.simulation.isRunning,
+  )
+  const preRunLayoutRef = useRef<{
+    drawerOpen: boolean
+    toolboxCollapsed: boolean
+    chatOpen: boolean
+  } | null>(null)
+  useEffect(() => {
+    if (isSimulationRunning && !preRunLayoutRef.current) {
+      preRunLayoutRef.current = {
+        drawerOpen,
+        toolboxCollapsed: viewSettings.toolboxCollapsed,
+        chatOpen,
+      }
+      if (drawerOpen) dispatch(openDrawer(false))
+      if (!viewSettings.toolboxCollapsed) {
+        updateViewSettings({ toolboxCollapsed: true })
+      }
+      // Copilot joins the other two, and it is the one that matters most. With the
+      // robot panel a column with room reserved for it, an open Copilot competes with
+      // it: three surfaces divide the viewport and the workspace, the one showing which
+      // block is running, is squeezed between them. Nothing an operator does with
+      // Copilot happens DURING a run (it writes blocks into a workspace that is
+      // executing and cannot be edited), so it is the safest to fold away and the one
+      // whose absence gives the run the most room.
+      if (chatOpen) dispatch(toggleChat())
+    } else if (!isSimulationRunning && preRunLayoutRef.current) {
+      const snapshot = preRunLayoutRef.current
+      preRunLayoutRef.current = null
+      dispatch(openDrawer(snapshot.drawerOpen))
+      updateViewSettings({ toolboxCollapsed: snapshot.toolboxCollapsed })
+      // Restored, not left closed: the operator did not close it, the run did,
+      // and a panel that never comes back teaches them to stop opening it.
+      if (snapshot.chatOpen !== chatOpen) dispatch(toggleChat())
+    }
+    // eslint-disable-next-line @eslint-react/exhaustive-deps
+  }, [isSimulationRunning])
+
+  // Chat interaction states
+  const [newChatResponse, setNewChatResponse] = useState(false)
+  const [pendingChatTask, setPendingChatTask] = useState<State | null>(null)
+  const [taskStructure, setTaskStructure] = useState<any[]>([])
+  const [workspace, setWorkspace] = useState<Blockly.WorkspaceSvg | null>(null)
+
+  // SWR queries for libraries
+  // NO_ROWS, not an inline `= []`: an inline literal is a new array on every
+  // render while the request is still in flight, and these feed useMemo chains
+  // whose output ends up in an effect that sets state. dataMacros did exactly
+  // that — new array → new filteredMacros → new macroDetailsById → new
+  // macroContext → useConformance's effect re-ran → setResult → re-render →
+  // new array again, until React threw "Maximum update depth exceeded". The
+  // others are the same hazard waiting for a caller to wire them the same way.
+  const { data: dataObjects = NO_ROWS, isLoading: isLoadingObjects } = useSWR<
+    ObjectListType[],
+    Error
+  >({
+    url: endpoints.graphic.objectsGraphic,
+  })
+  const { data: dataActions = NO_ROWS, isLoading: isLoadingActions } = useSWR<
+    ActionListType[],
+    Error
+  >({
+    url: endpoints.graphic.actionsGraphic,
+  })
+  const { data: dataLocations = NO_ROWS, isLoading: isLoadingLocations } =
+    useSWR<LocationListType[], Error>({
+      url: endpoints.graphic.locationsGraphic,
+    })
+  const { data: dataMacros = NO_ROWS } = useSWR<TaskType[], Error>({
+    url: endpoints.graphic.macroList,
+  })
+
+  const currentTaskId = id ? Number(id) : -1
+
+  // Filter out the current task to prevent infinite recursion/self-reference cycles
+  const filteredMacros = useMemo(
+    () => dataMacros.filter((m) => m.id !== currentTaskId),
+    [dataMacros, currentTaskId],
+  )
+
+  // Derive macroDetailsById mapping (published_workspace maps to code) for block explosion and tooltips preview
+  const macroDetailsById = useMemo(
+    (): Record<number, TaskDetailType> =>
+      Object.fromEntries(
+        filteredMacros.map((m) => [
+          m.id,
+          {
+            id: m.id,
+            name: m.name,
+            description: m.description,
+            shared: m.shared,
+            owner: m.owner,
+            owner__username: m.owner__username,
+            status: m.status,
+            task_type: m.task_type,
+            signature: m.signature,
+            code: m.published_workspace ?? null,
+          } satisfies TaskDetailType,
+        ]),
+      ),
+    [filteredMacros],
+  )
+
+  // SWR query for specific task
+  const {
+    data: taskData,
+    isLoading: isTaskLoading,
+    mutate: mutateTask,
+  } = useSWR<TaskDetailType, Error>(
+    id ? { url: endpoints.home.libraries.task, body: { id } } : null,
+  )
+
+  // Set active task info in Redux on load
+  useEffect(() => {
+    if (taskData && isCreatedHere) {
+      // Just created by this page: the canvas already holds these blocks.
+      // Re-deriving the structure from the server's copy would replace what
+      // the operator typed during the round trip, and is the same clobbering
+      // the autosave path avoids by not refetching (see saveTaskToBackend).
+      dispatch(
+        setActiveTask({
+          id: taskData.id.toString(),
+          name: taskData.name,
+          status: taskData.status,
+        }),
+      )
+      return
+    }
+    if (taskData) {
+      // Read is legitimate for owner-or-shared (task_detail's GET), but every
+      // write endpoint is owner-only — a task that loaded fine can still be
+      // read-only. taskData.owner is undefined only if task_detail's response
+      // predates this field (shouldn't happen post-deploy, but don't treat a
+      // missing owner as "not mine" and lock out the actual owner).
+      const taskIsReadOnly =
+        taskData.owner !== undefined &&
+        currentUserId !== null &&
+        String(taskData.owner) !== currentUserId &&
+        taskData.shared
+      dispatch(
+        setActiveTask({
+          id: taskData.id.toString(),
+          name: taskData.name,
+          status: taskData.status,
+          isReadOnly: taskIsReadOnly,
+          ownerUsername: taskData.owner__username ?? null,
+          description: taskData.description ?? '',
+        }),
+      )
+      // lastSaved is a single global Redux flag with no per-task scope, so
+      // without seeding it here it either stays null (StatusBar wrongly
+      // shows "Draft not saved" on a freshly-opened, untouched task) or
+      // leaks a previous task's save time into this one when navigating
+      // task-to-task without a remount. Seed it from the record's own
+      // last_modified so it reflects reality until the next real save.
+      //
+      // HH:mm, not HH:mm:ss. Autosave fires roughly every two seconds while
+      // the operator works, and every one of those rewrote the seconds digit
+      // in the corner of the screen — constant peripheral motion carrying a
+      // figure nobody acts on. The minute is the answer to "is my work safe".
+      if (taskData.last_modified) {
+        dispatch(setLastSaved(dayjs(taskData.last_modified).format('HH:mm')))
+      }
+      // Same per-visit leak as lastSaved: loading a task must not inherit
+      // "unsaved edits" from whatever was open before. The deserialize below
+      // happens inside Blockly.Events.disable()/enable() (BlocklyWorkspace.tsx),
+      // so it never fires the structural-change listener that would set this.
+      dispatch(setHasUnsavedEdits(false))
+      if (taskData.code) {
+        if (isBlocklyPayload(taskData.code)) {
+          const abstract = blocklyToAbstractAll(
+            taskData.code as unknown as CustomBlock[] | null,
+          )
+          setTaskStructure(abstract || [])
+        } else {
+          setTaskStructure(taskData.code as unknown as any[])
+        }
+      }
+    } else if (!id) {
+      dispatch(
+        setActiveTask({
+          id: null,
+          name: 'New Task',
+          status: 'draft',
+          description: '',
+        }),
+      )
+      // Same leak as above, the other direction: a brand-new task has never
+      // been saved, but lastSaved would still carry whatever the previously
+      // open task last saved at if not cleared here.
+      dispatch(setLastSaved(null))
+      dispatch(setHasUnsavedEdits(false))
+      setTaskStructure([])
+    }
+  }, [taskData, id, dispatch, currentUserId, isCreatedHere])
+
+  // Convert initial backend structure to Blockly block structure
+  const initialDataTask = useMemo(() => {
+    if (!taskData || !taskData.code) return null
+
+    if (isBlocklyPayload(taskData.code)) {
+      return taskData.code as unknown as State
+    }
+
+    const converted = abstractToBlockly(
+      taskData.code as unknown as any[],
+      dataObjects,
+      dataLocations,
+      dataActions,
+    )
+    return isBlockState(converted) ? converted : null
+  }, [taskData, dataObjects, dataLocations, dataActions])
+
+  const [editorDataTask, setEditorDataTask] = useState<State | null>(null)
+
+  useEffect(() => {
+    // Not for a task this page just created: BlocklyWorkspace disposes and
+    // re-injects the canvas whenever this prop changes identity, and the
+    // canvas already shows those blocks. Filling it in now would rebuild the
+    // workspace a second after the first save, undo history included.
+    if (initialDataTask && !editorDataTask && !isCreatedHere) {
+      setEditorDataTask(initialDataTask)
+    }
+  }, [initialDataTask, editorDataTask, isCreatedHere])
+
+  // Conformance tracking
+  const { isReady, issues, formattedIssues } = useConformance(
+    workspace,
+    viewSettings.blockViewMode === 'complete',
+    {
+      currentTaskId: currentTaskId === -1 ? null : currentTaskId,
+      macroDetailsById,
+    },
+  )
+  const isCanvasEmpty = issues.some((i) => i.type === 'EMPTY_WORKSPACE')
+
+  // Sync workspace readiness + why-not-ready to Redux — Header/index.tsx
+  // shows the issue count next to Save without needing the live workspace.
+  useEffect(() => {
+    dispatch(setWorkspaceReady(isReady))
+    dispatch(setConformanceIssues(formattedIssues))
+  }, [isReady, formattedIssues, dispatch])
+
+  // Save / Publish pipeline matching the original Graphic logic
+  const saveTaskToBackend = useCallback(
+    async (currentName: string, isPublish: boolean, isAutoSave = false) => {
+      if (isSaving) return
+      dispatch(setSaving(true))
+
+      const visualStructure = getBlocklyStructure()
+
+      try {
+        let targetId = id ? Number(id) : null
+
+        if (!targetId) {
+          // If we don't have an ID, we must FIRST create the task row via metadata POST endpoint.
+          // rethrowOn: [400] — a name collision (e.g. the default "New Task"
+          // reused by a second untitled task) otherwise resolves here with
+          // the backend's {nameAlreadyExists: true} payload instead of an
+          // id, which the check below cannot tell apart from any other
+          // failure and would report as a generic connection problem.
+          const res = await fetchApi<any, any>({
+            url: endpoints.home.libraries.task,
+            method: MethodHTTP.POST,
+            rethrowOn: [400],
+            body: {
+              id: -1,
+              name: currentName,
+              // No canned description: a literal "Visual task program" subtitle would show
+              // everywhere (task list, Check for problems). Leaving it unset (backend defaults
+              // to null) lets the card omit the subtitle until the operator writes a real one.
+              shared: false,
+              task_type: 'task',
+              status: 'draft',
+            },
+          })
+
+          if (res && res.id) {
+            targetId = res.id
+            setCreatedHereId(String(res.id))
+            dispatch(
+              setActiveTask({
+                id: res.id.toString(),
+                name: currentName,
+                status: 'draft',
+              }),
+            )
+          } else {
+            throw new Error('Failed to create task record')
+          }
+        }
+
+        // Now save the visual workspace structure to the appropriate endpoint based on isPublish!
+        if (isPublish) {
+          await fetchApi({
+            url: endpoints.task.publish,
+            method: MethodHTTP.POST,
+            body: {
+              id: targetId,
+              taskStructure: visualStructure,
+            },
+          })
+        } else {
+          await fetchApi({
+            url: endpoints.task.saveDraft,
+            method: MethodHTTP.PUT,
+            body: {
+              id: targetId,
+              taskStructure: visualStructure,
+            },
+          })
+        }
+
+        // If the task name was edited, update task metadata name
+        if (taskData && taskData.name !== currentName) {
+          await fetchApi({
+            url: endpoints.home.libraries.task,
+            method: MethodHTTP.PUT,
+            body: {
+              ...taskData,
+              name: currentName,
+            },
+          })
+        }
+
+        if (isAutoSave) {
+          // The resulting status is fully predictable from save_draft's own
+          // rule (task_lifecycle.py: draft/published_with_draft stay put,
+          // published -> published_with_draft) — no need to round-trip for
+          // it. A full mutateTask() here (autosave fires every ~2s while
+          // typing) re-fetched the task on every keystroke pause, which
+          // re-ran the "on load" effect above and clobbered the in-progress
+          // taskStructure/isReadOnly/hasUnsavedEdits state with a server
+          // echo of what was just saved — the visible "workspace refreshes
+          // on its own" symptom.
+          const newStatus: TaskStatus = isPublish
+            ? 'published'
+            : taskData?.status === 'published'
+              ? 'published_with_draft'
+              : (taskData?.status ?? 'draft')
+          dispatch(
+            setActiveTask({
+              // targetId is non-null here: the branch above either read it
+              // from an existing `id` or throws before falling through.
+              id: targetId!.toString(),
+              name: currentName,
+              status: newStatus,
+            }),
+          )
+        } else {
+          // Invalidate and sync SWR cache and status in real-time
+          const updatedTask = await mutateTask()
+          if (updatedTask) {
+            dispatch(
+              setActiveTask({
+                id: updatedTask.id.toString(),
+                name: updatedTask.name,
+                status: updatedTask.status,
+              }),
+            )
+          }
+          void mutate({ url: endpoints.home.libraries.tasks })
+        }
+        dispatch(setLastSaved(dayjs().format('HH:mm')))
+        dispatch(triggerSavedFlash(true))
+        dispatch(setSaveError(false))
+        // The just-saved structure is now what would run — Run can trust
+        // activeTaskStatus/workspaceReady again (see setHasUnsavedEdits(true)
+        // in handleTaskStructureChange below for why this was ever false).
+        dispatch(setHasUnsavedEdits(false))
+
+        if (!id && targetId) {
+          // If it was a newly created task, navigate to the correct URL path
+          navigate(`/task/${targetId}`, { replace: true })
+        }
+
+        if (!isAutoSave) {
+          toast.success(
+            isPublish
+              ? 'Task saved and published successfully'
+              : 'Draft saved successfully',
+          )
+        }
+      } catch (err) {
+        console.error('Failed to save task:', err)
+        // Autosave failures show no toast (would fire every 2s while the
+        // connection is down) — this flag is the only persistent signal.
+        dispatch(setSaveError(true))
+        // A 400 (e.g. the name collision above) already got its own
+        // specific, accurate toast from fetchApi — a second generic
+        // "Failed to save draft" on top of it just buries the real reason.
+        const alreadyToasted = err instanceof Error && err.name === '400'
+        if (!isAutoSave && !alreadyToasted) {
+          toast.error(
+            isPublish ? 'Failed to publish task' : 'Failed to save draft',
+          )
+        }
+      } finally {
+        dispatch(setSaving(false))
+      }
+    },
+    [id, isSaving, taskData, dispatch, navigate, mutate, mutateTask],
+  )
+
+  // Debounced auto-save handler (2 seconds)
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const handleTaskStructureChange = (
+    newStructure: import('pages/tasks/types').ASTBranch[] | null,
+  ) => {
+    // Belt-and-suspenders: BlocklyEditor's editMode={!isReadOnly} should
+    // already stop the user from producing structural changes at all on a
+    // shared-not-mine task, but never let an edit reach the 2s autosave
+    // debounce regardless — the write endpoint would 404 "Task not found"
+    // (owner-only by design) and surface as a confusing generic save error.
+    if (isReadOnly) return
+    const structureArray = newStructure || []
+    setTaskStructure(structureArray)
+    // Set synchronously, not after the debounce fires — a task that WAS
+    // published still reads activeTaskStatus === 'published' for up to 2s
+    // (longer if the operator keeps editing, since each change re-arms this
+    // timer) after a real edit. Without this, Run stays the filled primary
+    // action during that whole window and would run the stale published
+    // version while the screen shows the new one.
+    dispatch(setHasUnsavedEdits(true))
+
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current)
+    }
+
+    saveTimeoutRef.current = setTimeout(() => {
+      // Null it first: this ref is what "a save is still pending" is read from
+      // (the unmount flush and the beforeunload prompt below), so leaving a
+      // spent handle in it makes both of them fire for a save that already ran.
+      saveTimeoutRef.current = null
+      void saveTaskToBackend(activeTaskName, false, true)
+    }, 2000)
+  }
+
+  // A pending autosave must survive leaving the page. The unmount cleanup flushes
+  // instead of clearing the timer: cancelling silently drops any edit made in the
+  // last 2 seconds while the status bar still reads "Saved at HH:mm" (a timestamp
+  // of the previous save, see StatusBar).
+  //
+  // Flushing is safe: saveTaskToBackend closes over module-level fetchApi and Redux
+  // dispatch, neither of which needs this component to still be mounted. Refs, not
+  // state, because the cleanup runs after the last render and must see the values
+  // as they were then.
+  const flushPendingSaveRef = useRef<(() => void) | null>(null)
+  flushPendingSaveRef.current = () => {
+    if (!saveTimeoutRef.current) return
+    clearTimeout(saveTimeoutRef.current)
+    saveTimeoutRef.current = null
+    if (isReadOnly) return
+    void saveTaskToBackend(activeTaskName, false, true)
+  }
+
+  useEffect(() => {
+    return () => {
+      flushPendingSaveRef.current?.()
+    }
+  }, [])
+
+  // Closing or reloading the tab never unmounts anything, so the flush above
+  // cannot cover it. The browser only honours a synchronous warning here — an
+  // async save would be cut off — so this asks rather than saves.
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!saveTimeoutRef.current) return
+      e.preventDefault()
+      // Chrome ignores custom text and shows its own wording; assigning
+      // returnValue is still what triggers the prompt at all.
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+
+  // Manual save trigger listener
+  useEffect(() => {
+    if (saveTriggered) {
+      dispatch(triggerSave(false)) // Reset immediately to prevent multiple triggers
+      // Header's Save button is already disabled when isReadOnly, but Ctrl/Cmd+S
+      // below dispatches unconditionally — stop it here too before it 404s.
+      if (isReadOnly) return
+
+      // Clear any pending debounced auto-save timeout to prevent race condition status downgrades
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current)
+        saveTimeoutRef.current = null
+      }
+
+      void saveTaskToBackend(activeTaskName, isReady, false)
+    }
+  }, [
+    saveTriggered,
+    activeTaskName,
+    isReady,
+    saveTaskToBackend,
+    dispatch,
+    isReadOnly,
+  ])
+
+  // Ctrl/Cmd+S → same save trigger the header Save button dispatches.
+  // preventDefault blocks the browser's native "Save Page As" dialog — it runs
+  // before the guards below because the app owns this shortcut everywhere on
+  // this screen: dropping back to the browser dialog on top of an open modal,
+  // or mid-sentence in the Copilot box, is not the fallback anyone wants.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        // A modal on top owns the keyboard. The Header's "Discard these unpublished
+        // changes?" confirm, the robot panel's real-run confirm and the editor's own
+        // dialogs all sit over this workspace, and this listener must not save/publish
+        // underneath one of them while the user is being asked whether to throw those
+        // very changes away. Same shape as DigitalTwinPanel's Escape guard, read from the
+        // DOM because none of those dialogs' open-state lives in this component (see
+        // utils/keyboardGuards.ts).
+        if (isModalOpen()) return
+        // Focus in a text field means the keystroke belongs to that field.
+        // The header's rename input is the one exception, and it handles
+        // Ctrl/Cmd+S itself so the in-progress name is committed to Redux
+        // before the save reads it (Header/index.tsx).
+        if (isTypingInTextControl()) return
+        dispatch(triggerSave(true))
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [dispatch])
+
+  // Metadata-only trigger listener — a header edit to the task's NAME or its
+  // DESCRIPTION. It must never go through saveTaskToBackend/triggerSave, which
+  // also (re)publishes the whole workspace whenever it happens to pass
+  // conformance; retitling a task should not have that side effect.
+  //
+  // The action is still called triggerRename because its contract has not
+  // changed: one PUT of the task's own fields, no workspace, no publish.
+  useEffect(() => {
+    if (renameTriggered) {
+      dispatch(triggerRename(false)) // Reset immediately to prevent multiple triggers
+      if (isReadOnly) return
+      const changed =
+        !!taskData &&
+        (taskData.name !== activeTaskName ||
+          (taskData.description ?? '') !== activeTaskDescription)
+      if (id && taskData && changed) {
+        fetchApi<{ nameAlreadyExists?: boolean }>({
+          url: endpoints.home.libraries.task,
+          method: MethodHTTP.PUT,
+          body: {
+            ...taskData,
+            name: activeTaskName,
+            description: activeTaskDescription,
+          },
+        })
+          .then(async (res) => {
+            // The endpoint answers a taken name with 400 + nameAlreadyExists, and fetchApi
+            // RESOLVES on 400 (services/api.ts), so this branch also runs for a rename that
+            // did not happen: it must not flash "Saved at HH:mm" next to the red error
+            // toast. The refetch still runs: it puts the real, unchanged name back in the
+            // header, which is the honest thing to show once the rename was refused.
+            const renamed = !res?.nameAlreadyExists
+            const updatedTask = await mutateTask()
+            if (updatedTask) {
+              dispatch(
+                setActiveTask({
+                  id: updatedTask.id.toString(),
+                  name: updatedTask.name,
+                  status: updatedTask.status,
+                  // From the server's copy, so a description refused along
+                  // with a duplicate name is put back the way the name is.
+                  description: updatedTask.description ?? '',
+                }),
+              )
+            }
+            if (!renamed) return
+            void mutate({ url: endpoints.home.libraries.tasks })
+            dispatch(setLastSaved(dayjs().format('HH:mm')))
+            dispatch(triggerSavedFlash(true))
+          })
+          .catch((err) => {
+            console.error('Failed to save task details:', err)
+            toast.error("Couldn't save the task's name or description")
+          })
+      }
+    }
+  }, [
+    renameTriggered,
+    id,
+    taskData,
+    activeTaskName,
+    activeTaskDescription,
+    dispatch,
+    mutateTask,
+    mutate,
+    isReadOnly,
+  ])
+
+  // Discard draft trigger listener
+  useEffect(() => {
+    if (discardTriggered) {
+      dispatch(triggerDiscard(false)) // Reset immediately to prevent multiple triggers
+      if (isReadOnly) return
+      if (id) {
+        dispatch(setSaving(true))
+        dispatch(setDiscarding(true))
+        fetchApi({
+          url: endpoints.task.discardDraft,
+          method: MethodHTTP.POST,
+          body: { id: Number(id) },
+        })
+          .then(async () => {
+            toast.success('Draft discarded')
+            // Wait for the refetch to land before clearing editorDataTask —
+            // the repopulate effect (below) only fills in initialDataTask
+            // when editorDataTask is null, so clearing it first (before
+            // taskData/initialDataTask actually reflect the published
+            // version) reloads the same stale draft right back in.
+            const updatedTask = await mutateTask()
+            // Push the new status into Redux here rather than relying on the
+            // load effect re-running. This was the only one of the four write
+            // paths (save, publish, rename, discard) that left it implicit,
+            // and the assumption does not hold: the autosave path never
+            // refetches, so taskData can already read 'published' while Redux
+            // reads 'published_with_draft'. The refetch then returns the same
+            // status, SWR sees unchanged data, the effect never re-runs, and
+            // the "Discard unpublished changes" button stays on screen for a
+            // task that has none — offering to undo work that is not there.
+            if (updatedTask) {
+              dispatch(
+                setActiveTask({
+                  id: updatedTask.id.toString(),
+                  name: updatedTask.name,
+                  status: updatedTask.status,
+                }),
+              )
+            }
+            dispatch(setHasUnsavedEdits(false))
+            // From here the server's copy is the truth again, so the guards
+            // that protect a freshly created task must let go.
+            setCreatedHereId(null)
+            setEditorDataTask(null) // Force workspace reload from the newly fetched published state
+            void mutate({ url: endpoints.home.libraries.tasks })
+          })
+          .catch((err) => {
+            console.error('Failed to discard draft:', err)
+            toast.error('Failed to discard draft')
+          })
+          .finally(() => {
+            dispatch(setSaving(false))
+            dispatch(setDiscarding(false))
+          })
+      }
+    }
+  }, [discardTriggered, id, dispatch, mutateTask, mutate, isReadOnly])
+
+  const isLoading =
+    isLoadingObjects ||
+    isLoadingActions ||
+    isLoadingLocations ||
+    (id && isTaskLoading && !taskData && !isCreatedHere)
+
+  if (isLoading) {
+    return (
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: 'calc(100vh - 56px)',
+          gap: 2,
+        }}
+      >
+        <CircularProgress color="primary" />
+        <Typography variant="body2" color="text.secondary">
+          Loading your task…
+        </Typography>
+      </Box>
+    )
+  }
+
+  return (
+    <Box
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: 'calc(100vh - 56px)',
+        overflow: 'hidden',
+        position: 'relative',
+      }}
+    >
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: 'row',
+          flex: 1,
+          overflow: 'hidden',
+          width: '100%',
+          gap: 'var(--layout-gutter)',
+          p: 'var(--layout-gutter)',
+          // Room for the robot panel, reserved HERE and not on the workspace.
+          //
+          // The panel is `position: fixed`, so it covers whatever is under it. A
+          // `width: calc(100% - 35vw)` on the workspace child does nothing: the child is
+          // `flex: 1` (flex-basis 0, grow 1) and in a flex row flex sizing wins over
+          // `width`, so the canvas spans the full row and everything anchored to its right
+          // edge (the zoom and fit-to-screen controls) goes under the panel.
+          //
+          // Padding on the container works: it shrinks the row's content box, flex then
+          // distributes what is left, and it stays correct whichever side Copilot is on and
+          // whatever width it has been dragged to.
+          //
+          // TWO gutters, not one. The panel's own 12px inset is the distance from it to the
+          // VIEWPORT EDGE, not the gap between the panel and whatever sits to its left;
+          // reserving only `width + inset` puts the content boundary exactly on the panel's
+          // left edge and the two cards touch. width + inset + gutter leaves the same 12px
+          // here as the `gap` above leaves between Copilot and the workspace.
+          //
+          // Mirrors the panel's own clamp (it never takes more than what is left over the
+          // workspace's minimum), so this can follow the request without repeating the
+          // arithmetic. Reads the SAME custom property the panel sizes itself from, so the
+          // two move in the same frame; reading `robotPanelWidth` from Redux, written only
+          // when a drag ends, would leave the workspace behind mid-drag.
+          paddingRight: simOpen
+            ? `calc(min(var(--robot-panel-width, 520px), calc(64vh + 32px), calc(100vw - 584px - var(--copilot-width, 0px))) + var(--layout-gutter) * 2)`
+            : 'var(--layout-gutter)',
+          // Animated when the panel OPENS or CLOSES, never while it is being
+          // dragged.
+          //
+          // Copilot is a flex sibling, so the gap beside it is a real `gap`
+          // property: change its width and the workspace re-lays out in the
+          // same pass, and the spacing is constant by construction. The robot
+          // panel is `position: fixed`, so nothing links it to the workspace —
+          // the gap is synthesised by this padding computing the same number
+          // the panel computes for its width. Two independent values that have
+          // to agree.
+          //
+          // This 300ms tween broke that agreement on every drag frame: the
+          // panel followed the pointer instantly while the padding eased
+          // towards it, so the gap visibly grew and shrank and the workspace
+          // arrived late. The panel's own width tween is disabled the same way
+          // for the same reason.
+          transition: 'padding-right 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+          'html[data-panel-resizing] &': { transition: 'none' },
+          bgcolor: 'background.default',
+          boxSizing: 'border-box',
+        }}
+      >
+        {/* Blockly visual workspace */}
+        <Box
+          sx={{
+            // No `width` here. It carried a calc() meant to make room for the
+            // robot panel and it never had any effect: `flex: 1` sets
+            // flex-basis 0 and grow 1, and flex sizing wins over `width` on the
+            // main axis. The room is reserved by the row's paddingRight above,
+            // where flex cannot ignore it.
+            flex: 1,
+            minWidth: 0,
+            height: '100%',
+            position: 'relative',
+            order: chatPosition === 'left' ? 2 : 1,
+          }}
+        >
+          {/* Empty canvas explains itself instead of just sitting blank. Why
+              "Save" isn't "Save & Publish" yet (useConformance's issues)
+              shows next to Save in the header instead of here — see
+              Header/index.tsx. */}
+          {isCanvasEmpty && (
+            <Box
+              sx={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                zIndex: 1,
+                pointerEvents: 'none',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '10px',
+                textAlign: 'center',
+              }}
+            >
+              <Blocks size={32} color={theme.palette.slate[400]} />
+              <Typography variant="body2" color="text.secondary">
+                Click a block in the toolbox to add it,
+                <br />
+                or ask Copilot to build the task for you.
+              </Typography>
+            </Box>
+          )}
+          <BlocklyEditor
+            onWorkspaceReady={setWorkspace}
+            dataLocations={dataLocations}
+            dataObjects={dataObjects}
+            dataActions={dataActions}
+            dataMacros={filteredMacros}
+            macroDetailsById={macroDetailsById}
+            currentTaskId={currentTaskId}
+            dataTask={editorDataTask}
+            pendingExternalTask={pendingChatTask}
+            editMode={!isReadOnly}
+            applyExternalTaskState={newChatResponse}
+            onExternalTaskStateApplied={() => {
+              setNewChatResponse(false)
+              setPendingChatTask(null)
+            }}
+            onTaskStructureChange={handleTaskStructureChange}
+            blockViewMode={viewSettings.blockViewMode}
+            deleteConfirmMode={viewSettings.deleteConfirmMode}
+            showStartBlock={viewSettings.showStartBlock}
+            viewSettings={viewSettings}
+            onViewSettingsChange={updateViewSettings}
+            onResetViewSettings={resetViewSettings}
+          />
+        </Box>
+
+        {/* AI Chat Copilot sidebar */}
+        <ChatThread
+          taskId={id || null}
+          taskStructure={taskStructure}
+          workspace={workspace}
+          onClose={() => dispatch(toggleChat())}
+          onApplyProposedTask={(proposed) => {
+            setTaskStructure(proposed)
+            const converted = abstractToBlockly(
+              proposed,
+              dataObjects,
+              dataLocations,
+              dataActions,
+            )
+            if (isBlockState(converted)) {
+              setPendingChatTask(converted)
+              setNewChatResponse(true)
+            } else {
+              // abstractToBlockly returns `{}` (no `type`) when every step in the proposal used
+              // a type it doesn't recognize. Unhandled, setNewChatResponse(true) still fires
+              // but with no valid pendingExternalTask the apply effect in BlocklyWorkspace.tsx
+              // no-ops, so Replace looks like it did nothing, with zero console error.
+              console.error(
+                'Chat proposal could not be converted to blocks',
+                proposed,
+              )
+              toast.error(
+                "Couldn't apply these blocks — the proposal used a step type the workspace doesn't support.",
+              )
+            }
+          }}
+        />
+      </Box>
+
+      {/* Digital Twin Panel slide-in (Step 8) */}
+      <DigitalTwinPanel
+        followRunningBlock={viewSettings.followRunningBlock}
+        taskId={id || ''}
+        // activeTaskStatus (Redux), not taskData.status (SWR). The autosave
+        // path deliberately skips the refetch — a mutateTask() on every
+        // keystroke pause clobbered the in-progress workspace — and instead
+        // predicts the new status into Redux. So taskData.status stays
+        // 'published' for the rest of the session after the first edit, while
+        // Redux is current. The Header already reads Redux; the panel read
+        // SWR, which is why the two contradicted each other on screen: one
+        // said "unpublished changes", the other "Ready to run".
+        taskStatus={activeTaskStatus}
+        workspace={workspace}
+        initialExecutionTarget={initialExecutionTarget}
+      />
+
+      {/* JSON Viewer Bottom Panel (Step 6) */}
+      <BottomPanel data={taskStructure} open={codeOpen} />
+
+      {/* StatusBar (Step 6) */}
+      <StatusBar />
+    </Box>
+  )
+}
+
+export default UnifiedWorkspace

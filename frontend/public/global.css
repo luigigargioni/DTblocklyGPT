@@ -1,42 +1,142 @@
+/* ─── DTblocklyGPT Design System v1.0 — Layout Tokens ───────────────────── */
+/* Geist / Geist Mono are self-hosted via @fontsource (src/index.tsx) — no
+   render-blocking Google Fonts @import here. */
+/* Update LAYOUT in utils/constants.ts to keep in sync */
+:root {
+  --layout-appbar-height: 56px;
+  --layout-statusbar-height: 40px;
+  --font-ui: 'Geist', 'Inter', 'General Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'Geist Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+}
+
+/* ─── Overscroll: the app shell does not rubber-band ─────────────────────
+   Reported: scrolling over the robot panel or the nav rail, where there is
+   nothing to scroll, bounced the WORKSPACE instead — the whole canvas plus the
+   status bar with "running" and "View code" shifted together.
+
+   That is scroll chaining. When a container cannot scroll, or has reached its
+   end, the browser hands the gesture to the nearest scrollable ancestor. On the
+   /task/ route the shell is `height: 100vh; overflow: hidden` (MainLayout), so
+   the nearest one left is the DOCUMENT, and what the operator saw was the page
+   itself rubber-banding under a UI that is supposed to be fixed.
+
+   `none` here rather than `contain`: this shell is not a scrollable surface at
+   any viewport, so there is no local overscroll worth keeping — only the chain
+   to remove. Inner panels use `contain`, which stops the chain while leaving
+   each panel its own end-of-list feedback. */
+html,
+body {
+  overscroll-behavior: none;
+}
+
+* {
+  font-family: var(--font-ui);
+}
+
+code, pre, .mono-text {
+  font-family: var(--font-mono) !important;
+}
+
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 *::-webkit-scrollbar-track {
-  background: #d9d9d9; /* gray5 */
+  background: transparent;
 }
 
 *::-webkit-scrollbar-thumb {
-  background: #bfbfbf; /* gray6 */
-  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.12) !important;
+  border-radius: 8px !important;
+  border: 2px solid transparent !important;
+  background-clip: padding-box !important;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #8c8c8c; /* gray7 */
+  background: rgba(0, 0, 0, 0.25) !important;
+  border: 2px solid transparent !important;
+  background-clip: padding-box !important;
 }
-  
-@font-face {
-    font-family: 'Public Sans';
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url("./fonts/w400.woff2") format('woff2');
-    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+
+/* ─── Premium Glassmorphic Toast Notifications (Design System) ───────────── */
+.Toastify__toast-container {
+  top: 72px !important; /* Positioned neatly below the 56px AppBar */
+  padding: 12px !important;
+  font-family: var(--font-ui) !important;
 }
-@font-face {
-    font-family: 'Public Sans';
-    font-style: normal;
-    font-weight: 500;
-    font-display: swap;
-    src: url("./fonts/w500.woff2") format('woff2');
-    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+
+.Toastify__toast {
+  backdrop-filter: blur(16px) saturate(120%) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(120%) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.04), 0 8px 16px -6px rgba(0, 0, 0, 0.04) !important;
+  padding: 14px 18px !important;
+  min-height: 52px !important;
+  color: #1E293B !important;
+  font-weight: 500 !important;
+  font-size: 0.85rem !important;
+  letter-spacing: -0.01em !important;
+  margin-bottom: 12px !important;
+  display: flex !important;
+  align-items: center !important;
+  transition: all 0.2s ease-in-out !important;
 }
-@font-face {
-    font-family: 'Public Sans';
-    font-style: normal;
-    font-weight: 600;
-    font-display: swap;
-    src: url("./fonts/w600.woff2") format('woff2');
-    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+
+/* Success Toast */
+.Toastify__toast--success {
+  border: 1px solid rgba(16, 185, 129, 0.2) !important;
+  background: rgba(240, 253, 250, 0.92) !important;
+}
+.Toastify__toast--success .Toastify__toast-icon svg {
+  fill: #10B981 !important;
+}
+
+/* Error Toast */
+.Toastify__toast--error {
+  border: 1px solid rgba(239, 68, 68, 0.2) !important;
+  background: rgba(254, 242, 242, 0.92) !important;
+}
+.Toastify__toast--error .Toastify__toast-icon svg {
+  fill: #EF4444 !important;
+}
+
+/* Warning Toast */
+.Toastify__toast--warning {
+  border: 1px solid rgba(245, 158, 11, 0.2) !important;
+  background: rgba(255, 251, 235, 0.92) !important;
+}
+.Toastify__toast--warning .Toastify__toast-icon svg {
+  fill: #F59E0B !important;
+}
+
+/* Info Toast */
+.Toastify__toast--info {
+  border: 1px solid rgba(59, 130, 246, 0.2) !important;
+  background: rgba(239, 246, 255, 0.92) !important;
+}
+.Toastify__toast--info .Toastify__toast-icon svg {
+  fill: #3B82F6 !important;
+}
+
+/* Close Button Overrides */
+.Toastify__close-button {
+  color: #94A3B8 !important;
+  opacity: 0.6 !important;
+  align-self: center !important;
+  margin-left: 8px !important;
+  transition: opacity 0.15s ease-in-out !important;
+}
+
+.Toastify__close-button:hover {
+  opacity: 1 !important;
+  color: #1E293B !important;
+}
+
+/* Toast Body Text styling */
+.Toastify__toast-body {
+  margin: 0 !important;
+  padding: 0 4px !important;
+  line-height: 1.4 !important;
+  font-weight: 500 !important;
 }

@@ -1,0 +1,543 @@
+/* ─── Accessibility ───────────────────────────────────────────────────────── */
+
+/* Skip-link: hidden until keyboard-focused, then visible top-left. */
+.skip-to-workspace {
+  position: absolute;
+  left: 8px;
+  top: -48px;
+  z-index: 2000;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: #4f46e5;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: top 0.15s ease;
+}
+.skip-to-workspace:focus {
+  top: 8px;
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* ─── Layout ──────────────────────────────────────────────────────────────── */
+
+.custom-dragdrop-layout {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid #e2e8f0;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.04),
+    0 8px 24px rgba(0, 0, 0, 0.06);
+  background-color: #ffffff;
+}
+
+.custom-dragdrop-workspace-wrapper {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  position: relative;
+}
+
+/* ─── Floating Workspace Controls ─────────────────────────────────────────── */
+
+.workspace-controls-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 35;
+  pointer-events: none;
+}
+
+.workspace-controls-group {
+  position: absolute;
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+  pointer-events: auto;
+}
+
+.workspace-controls-group--top-left {
+  top: 12px;
+  left: 12px;
+}
+
+.workspace-controls-group--top-right {
+  top: 12px;
+  right: 12px;
+}
+
+.workspace-controls-group--bottom-right {
+  right: 12px;
+  bottom: 12px;
+  flex-direction: column;
+}
+
+.workspace-control-button {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px !important;
+  border: 1px solid #e2e8f0 !important;
+  color: #334155 !important;
+  background-color: #ffffff !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.workspace-control-button:hover {
+  transform: translateY(-1px);
+  background-color: #f8fafc !important;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.12);
+}
+
+.workspace-control-button.Mui-disabled {
+  opacity: 0.45;
+  color: #94a3b8 !important;
+}
+
+/* Pressed/active look for toggles (e.g. toolbox hidden) — indigo, matches the
+   nav active-pill so "on" reads at a glance. */
+.workspace-control-button--active {
+  background-color: rgba(99, 102, 241, 0.12) !important;
+  border-color: rgba(99, 102, 241, 0.35) !important;
+  color: #6366f1 !important;
+}
+
+.workspace-control-button--active:hover {
+  background-color: rgba(99, 102, 241, 0.18) !important;
+}
+
+/* Hairline that separates concepts inside a control group (history | menu). */
+.workspace-controls-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: rgba(15, 23, 42, 0.1);
+}
+
+/* ─── Blockly Workspace ───────────────────────────────────────────────────── */
+
+#blocklyDiv {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.blocklySvg {
+  height: 100%;
+  width: 100%;
+  /* Matches canvasNeutral.bg (themes/theme/index.ts) — one canvas color. */
+  background-color: #fafafb !important;
+}
+
+/* Blockly hardcodes a #c6c6c6 stroke on this rect (fill is themeable via
+   componentStyles.workspaceBackgroundColour, stroke isn't). It's a sharp
+   rectangle at the SVG's own bounds, so the card's rounded corners clip it
+   away near the corners but not along the straight edges — a stray gray line
+   that doesn't match the card's own 1px divider border. The card border is
+   the only edge this UI needs. */
+.blocklyMainBackground {
+  stroke: none !important;
+}
+
+/* Blockly's keyboard-nav focus ring colors (--blockly-active-node-color,
+   --blockly-active-tree-color) are set as inline styles on the injection div
+   in BlocklyEditor.tsx's handleWorkspaceReady instead of here — a stylesheet
+   override raced against Blockly's own injected <style> tag and lost. */
+
+/* ─── Workspace UI elements ───────────────────────────────────────────────── */
+
+.blocklyZoom,
+.blocklyTrash {
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1));
+}
+
+.blocklyScrollbarHorizontal,
+.blocklyScrollbarVertical {
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+
+.blocklyScrollbarHorizontal:hover,
+.blocklyScrollbarVertical:hover {
+  opacity: 0.8;
+}
+
+/* ─── Native Blockly Tooltip ─────────────────────────────────────────────── */
+
+.blocklyTooltipDiv {
+  background: rgba(255, 255, 255, 0.96) !important;
+  border: 1px solid rgba(148, 163, 184, 0.35) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16) !important;
+  color: #0f172a !important;
+  font-size: 0.75rem !important;
+  font-weight: 500 !important;
+  line-height: 1.45 !important;
+  letter-spacing: 0.01em;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+  max-width: 320px;
+  padding: 8px 10px !important;
+  pointer-events: none;
+  white-space: pre-wrap;
+  z-index: 1200;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.blocklyTooltipDiv:empty {
+  display: none;
+}
+
+/* ─── Custom Delete Area Feedback ─────────────────────────────────────────── */
+
+.custom-toolbox--delete-over {
+  box-shadow:
+    inset 0 0 0 2px #dc2626,
+    0 0 0 1px rgba(220, 38, 38, 0.35);
+  background: linear-gradient(
+    180deg,
+    rgba(254, 242, 242, 0.88),
+    rgba(255, 255, 255, 0.98)
+  );
+}
+
+/* ==========================================================================
+   BLOCKLY CUSTOM SHADOW BLOCKS
+   ========================================================================== */
+
+/* ── Base ── */
+.custom-dashed-shadow-workspace > .blocklyPath,
+.custom-dashed-shadow-trigger > .blocklyPath,
+.custom-dashed-shadow-sequence > .blocklyPath,
+.custom-dashed-shadow-start > .blocklyPath {
+  stroke-width: 2px !important;
+  stroke-dasharray: 6, 5 !important;
+  fill-opacity: 1 !important;
+  stroke-opacity: 1 !important;
+  transition:
+    fill 0.18s ease,
+    stroke 0.18s ease;
+}
+
+.custom-dashed-shadow-workspace > .blocklyPath {
+  fill: rgba(0, 135, 62, 0.06) !important;
+  stroke: rgba(0, 135, 62, 0.35) !important;
+}
+.custom-dashed-shadow-workspace text.blocklyText {
+  /* Solid, not the 0.85-alpha the path/border use — composited over the
+     near-white canvas (#FAFAFB), 0.85 alpha reads at ~3.5:1, below the
+     4.5:1 AA contrast text needs. Hex is also 1-2% darker than the
+     block-fill value for the same reason: that one was tuned against pure
+     white, this canvas is very slightly darker. */
+  fill: #00853d !important;
+  font-weight: 700 !important;
+  font-size: 13px !important;
+}
+
+.custom-dashed-shadow-trigger > .blocklyPath {
+  fill: rgba(209, 72, 30, 0.06) !important;
+  stroke: rgba(209, 72, 30, 0.35) !important;
+}
+.custom-dashed-shadow-trigger text.blocklyText {
+  /* See .custom-dashed-shadow-workspace above: solid, slightly darker than
+     the block-fill value, for AA contrast on the near-white canvas. */
+  fill: #cc461d !important;
+  font-weight: 700 !important;
+  font-size: 13px !important;
+}
+
+.custom-dashed-shadow-sequence > .blocklyPath {
+  fill: rgba(117, 117, 133, 0.06) !important;
+  stroke: rgba(117, 117, 133, 0.35) !important;
+}
+.custom-dashed-shadow-sequence text.blocklyText {
+  /* See .custom-dashed-shadow-workspace above: solid, slightly darker than
+     the block-fill value, for AA contrast on the near-white canvas. */
+  fill: #727282 !important;
+  font-weight: 700 !important;
+  font-size: 13px !important;
+}
+
+/* ── Base: shadow start (teal, stessa struttura degli altri) ── */
+.custom-dashed-shadow-start > .blocklyPath {
+  stroke-width: 2px !important;
+  stroke-dasharray: 6, 5 !important;
+  fill-opacity: 1 !important;
+  stroke-opacity: 1 !important;
+  transition:
+    fill 0.18s ease,
+    stroke 0.18s ease;
+  fill: rgba(15, 118, 110, 0.06) !important;
+  stroke: rgba(15, 118, 110, 0.45) !important;
+}
+.custom-dashed-shadow-start text.blocklyText {
+  /* See .custom-dashed-shadow-workspace above: solid for AA contrast.
+     No darkening needed here — #0F766E already clears 4.5:1 at full
+     opacity on the near-white canvas (5.25:1). */
+  fill: #0f766e !important;
+  font-weight: 700 !important;
+  font-size: 13px !important;
+}
+
+/* ── Highlight: drag-target e selected ── */
+.shadow-block--drag-target.custom-dashed-shadow-start > .blocklyPath,
+.shadow-block--selected.custom-dashed-shadow-start > .blocklyPath {
+  fill: rgba(15, 118, 110, 0.15) !important;
+  stroke: #0f766e !important;
+}
+.shadow-block--drag-target.custom-dashed-shadow-start text.blocklyText,
+.shadow-block--selected.custom-dashed-shadow-start text.blocklyText {
+  fill: #0f766e !important;
+}
+
+/* ── Highlight ── */
+.shadow-block--drag-target > .blocklyPath,
+.shadow-block--selected > .blocklyPath {
+  fill-opacity: 1 !important;
+  stroke-opacity: 1 !important;
+}
+
+.shadow-block--drag-target.custom-dashed-shadow-workspace > .blocklyPath,
+.shadow-block--selected.custom-dashed-shadow-workspace > .blocklyPath {
+  fill: rgba(0, 135, 62, 0.15) !important;
+  stroke: #00873e !important;
+}
+.shadow-block--drag-target.custom-dashed-shadow-workspace text.blocklyText,
+.shadow-block--selected.custom-dashed-shadow-workspace text.blocklyText {
+  fill: #00873e !important;
+}
+
+.shadow-block--drag-target.custom-dashed-shadow-trigger > .blocklyPath,
+.shadow-block--selected.custom-dashed-shadow-trigger > .blocklyPath {
+  fill: rgba(209, 72, 30, 0.15) !important;
+  stroke: #d1481e !important;
+}
+.shadow-block--drag-target.custom-dashed-shadow-trigger text.blocklyText,
+.shadow-block--selected.custom-dashed-shadow-trigger text.blocklyText {
+  fill: #d1481e !important;
+}
+
+.shadow-block--drag-target.custom-dashed-shadow-sequence > .blocklyPath,
+.shadow-block--selected.custom-dashed-shadow-sequence > .blocklyPath {
+  fill: rgba(117, 117, 133, 0.15) !important;
+  stroke: #757585 !important;
+}
+.shadow-block--drag-target.custom-dashed-shadow-sequence text.blocklyText,
+.shadow-block--selected.custom-dashed-shadow-sequence text.blocklyText {
+  fill: #757585 !important;
+}
+
+/* ── Highlight: keyboard focus on an unfilled slot ──
+   Blockly marks the focused node with .shadow-block--focused, but ships no styling
+   for it here, so a shadow block reached with the arrow keys looked identical to
+   one nobody was on — the keyboard user had no way to tell where they were.
+   These rules give it the same appearance a click produces (the selectors above
+   fire on .shadow-block--selected, which is added only when the picker opens).
+   Kept as a separate block rather than appended to each selector above so the
+   pointer path and the keyboard path stay legible as two different triggers. */
+.shadow-block--focused.custom-dashed-shadow-start > .blocklyPath {
+  fill: rgba(15, 118, 110, 0.15) !important;
+  stroke: #0f766e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-start text.blocklyText {
+  fill: #0f766e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-workspace > .blocklyPath {
+  fill: rgba(0, 135, 62, 0.15) !important;
+  stroke: #00873e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-workspace text.blocklyText {
+  fill: #00873e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-trigger > .blocklyPath {
+  fill: rgba(209, 72, 30, 0.15) !important;
+  stroke: #d1481e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-trigger text.blocklyText {
+  fill: #d1481e !important;
+}
+.shadow-block--focused.custom-dashed-shadow-sequence > .blocklyPath {
+  fill: rgba(117, 117, 133, 0.15) !important;
+  stroke: #757585 !important;
+}
+.shadow-block--focused.custom-dashed-shadow-sequence text.blocklyText {
+  fill: #757585 !important;
+}
+.shadow-block--focused[class*='custom-dashed-shadow'] > .blocklyPath {
+  fill-opacity: 1 !important;
+  stroke-opacity: 1 !important;
+}
+
+.blockly-orphan > .blocklyPath {
+  opacity: 0.7;
+}
+
+.blockly-orphan > .blocklyLabelField text,
+.blockly-orphan > .blocklyImageField image {
+  opacity: 0.8;
+}
+
+/* ==========================================================================
+   LIVE EXECUTION HIGHLIGHT
+   Applied to the block currently being run by the robot (block_step events)
+   and its connected object/location. Independent of the yellow selection.
+   ========================================================================== */
+/* White stroke, indigo glow — two colours because there are two backgrounds
+   to separate from, and no single colour clears both.
+
+   An indigo (#6366F1) outline measures 1.01–1.42:1 against EVERY block fill in
+   the palette. Not a poor choice of hue: palette.ts is
+   tuned so all eight colours clear 4.5:1 against white LABEL text, which puts
+   them all at roughly the same relative luminance (0.115–0.183). Two colours
+   of equal luminance contrast at ~1:1 whatever their hue, so no palette colour
+   can ever outline a block visibly. The only free dimension is lightness, and
+   that is the one the palette's AA guarantee pins.
+
+   So: white against the block (4.51:1 at worst, 6.35:1 at best), and the
+   indigo glow against the canvas (#FAFAFB, 4.28:1) where white would vanish
+   at 1.04:1. Each colour does the job it is actually good at.
+
+   The glow never reaches zero: animating 0 → 0.7 → 0 would make even a perfect
+   colour invisible for half of every cycle. */
+.block--executing > .blocklyPath,
+.block--executing-entity > .blocklyPath {
+  stroke: #ffffff !important;
+  /* 2px, not 3. The stroke is centred on the block's path, so half of it lies
+     outside the block on the canvas where white reads 1.04:1 and contributes
+     nothing — a thicker line mostly buys a wider invisible half and a heavier
+     look. Contrast against the fill is a property of the colour, not of the
+     width, so the 4.51:1 worst case is unchanged. */
+  stroke-width: 2px !important;
+  animation: blockExecuting 1.4s ease-in-out infinite;
+}
+
+@keyframes blockExecuting {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 4px rgba(99, 102, 241, 0.45));
+  }
+  50% {
+    filter: drop-shadow(0 0 9px rgba(99, 102, 241, 0.95));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .block--executing > .blocklyPath,
+  .block--executing-entity > .blocklyPath {
+    animation: none;
+    filter: drop-shadow(0 0 7px rgba(99, 102, 241, 0.75));
+  }
+}
+
+/* ==========================================================================
+   BLOCKLY TOASTS (keyboard-navigation hints)
+   Blockly v13 shows its own toasts for copy/cut and the screen-reader mode
+   nudge (core/hints.ts). Its default style is a 1.2rem black-bordered box
+   pinned bottom-right — correct, but from a different design language than
+   every other surface here. Restyled to match MENU_PAPER_SX (editor/
+   menuStyles.ts), which is the one elevation shared by the context menu, the
+   shadow picker, ⋯ More, Settings and the Cmd/Ctrl+K search.
+   Selectors are single-class to stay at Blockly's own specificity; Blockly
+   registers its CSS first, so equal specificity is enough and !important is
+   not needed.
+   ========================================================================== */
+.blocklyToast {
+  font-family: inherit;
+  font-size: 13px;
+  padding: 10px 14px;
+  gap: 10px;
+  color: #0f172a;
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+  max-width: 320px;
+}
+
+.blocklyToast .blocklyToastMessage {
+  max-width: 260px;
+}
+
+.blocklyToast .blocklyToastCloseButton {
+  color: #64748b;
+  border-radius: 6px;
+  padding: 3px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* Blockly draws the X as an inline SVG with width/height hard-coded to 24 in
+   the element's attributes, so it does NOT follow the toast's font-size — once
+   the text came down to 13px the icon stayed at its original scale and became
+   the loudest thing in the toast. CSS width/height beat presentation
+   attributes, and the viewBox keeps the glyph proportional. */
+.blocklyToast .blocklyToastCloseButton svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+/* The two bars of the X carry fill="black" as an attribute, which no colour on
+   the button would ever reach — presentation attributes lose to any CSS rule,
+   so this is what makes the icon follow the hover/focus colour below. */
+.blocklyToast .blocklyToastCloseButton svg rect {
+  fill: currentColor;
+}
+
+.blocklyToast .blocklyToastCloseButton:hover {
+  background-color: #f1f5f9;
+  color: #0f172a;
+}
+
+.blocklyToast .blocklyToastCloseButton:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 1px;
+}
+
+/* Blockly animates the toast in by moving `bottom`; keep that but respect a
+   reduced-motion preference, same as the execution highlight above. */
+@media (prefers-reduced-motion: reduce) {
+  .blocklyToast {
+    transition: none;
+  }
+}
+
+/* ── The warning triangle must not steal a click from the block under it ──
+   A shadow slot that has not been filled in carries a native Blockly warning
+   icon (useConformance sets it via setWarningText). That icon sits ON the
+   shadow block, and the shadow block's own click is what opens the picker
+   that fills the slot and removes the warning — so the marker occupied part
+   of the target you have to hit to make it go away: once an operator has
+   understood the dashed slots and moves quickly, they keep landing on the
+   triangle instead of the slot.
+
+   Click-through rather than removal: the triangle still marks the block, it
+   just stops being a control. No text is lost either, because the bubble it
+   opened repeats what the header's issue list already says word for word
+   (both render formatIssue on the same ConformanceIssue).
+
+   Scoped to .blocklyWarningIcon, not the shared .blocklyIconGroup: the
+   comment and mutator icons carry that group class too, and this app does
+   not draw either today only because its mutators are serialization-only
+   (no compose/decompose, so no gear). Naming the warning keeps that from
+   becoming a trap for whoever adds the first real mutator. */
+.blocklyWarningIcon {
+  pointer-events: none;
+}

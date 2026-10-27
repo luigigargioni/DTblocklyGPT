@@ -1,15 +1,16 @@
-import React, { useEffect, useState } from 'react'
-import { Grid, Stack, Typography } from '@mui/material'
+import React, { useEffect } from 'react'
+import { Box, Typography } from '@mui/material'
 import { useSearchParams } from 'react-router-dom'
 import { toast } from 'react-toastify'
 
-import { ResetPasswordForm } from 'pages/login/ResetPasswordForm'
 import { MessageText } from 'utils/messages'
+import { useDocumentTitle } from 'hooks/useDocumentTitle'
+
 import { LoginForm } from './LoginForm'
 import { LoginWrapper } from './LoginWrapper'
 
 const Login = () => {
-  const [resetPassword, setResetPassword] = useState(false)
+  useDocumentTitle('Login')
   const [searchParams, setSearchParams] = useSearchParams()
   const expired = !!searchParams.get('expired')
 
@@ -22,26 +23,15 @@ const Login = () => {
 
   return (
     <LoginWrapper>
-      <Grid container spacing={3}>
-        <Grid size={12}>
-          <Stack
-            direction="row"
-            justifyContent="space-between"
-            alignItems="baseline"
-            sx={{ mb: { xs: -0.5, sm: 0.5 } }}
-          >
-            <Typography variant="h3">
-              {resetPassword ? 'Reset password' : 'Login'}
-            </Typography>
-          </Stack>
-        </Grid>
-        <Grid size={12}>
-          {!resetPassword && <LoginForm setResetPassword={setResetPassword} />}
-          {resetPassword && (
-            <ResetPasswordForm setResetPassword={setResetPassword} />
-          )}
-        </Grid>
-      </Grid>
+      <Box sx={{ mb: 3, textAlign: 'center' }}>
+        <Typography variant="h3" component="h1" sx={{ fontWeight: 600 }}>
+          Welcome back
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+          Sign in to your DTblocklyGPT account.
+        </Typography>
+      </Box>
+      <LoginForm />
     </LoginWrapper>
   )
 }

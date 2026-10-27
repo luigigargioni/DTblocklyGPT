@@ -1,0 +1,341 @@
+/**
+ * BlocklyWorkspace.tsx
+ *
+ * React wrapper that manages the lifecycle of the main interactive Blockly
+ * workspace: injection, task loading, external state application, and teardown.
+ *
+ * Calls:
+ *  - `onWorkspaceReady(workspace)` once the workspace is injected and ready.
+ *  - `onTaskLoaded()` after the initial `dataTask` has been deserialised.
+ *  - `onExternalTaskStateApplied()` after a programmatic state update completes.
+ *
+ * Also exports `getBlocklyStructure()` — a module-level helper that returns the
+ * top-most block in the active workspace (used by serialisation helpers).
+ */
+import { useEffect, useRef } from 'react'
+import * as Blockly from 'blockly/core'
+import * as locale from 'blockly/msg/en'
+import 'blockly/blocks'
+
+import { BlockState } from 'utils/blocklyTypes'
+import { getOwnBodyDescendants } from 'utils/blocklySelection'
+import {
+  injectAllGhostBlocks,
+  registerGhostRestoreListener,
+  saveWorkspaceWithoutGhosts,
+} from 'utils/ghostBlockManager'
+
+import { isValidBlockState } from '../utils/serialization'
+
+import { updateStructureAndFireFakeChangeEvent } from './chatSync'
+import { INTERACTIVE_WORKSPACE_CONFIG } from './workspaceConfig'
+
+const localeMessages: Record<string, string> = {}
+for (const [key, value] of Object.entries(locale)) {
+  if (typeof value === 'string') {
+    localeMessages[key] = value
+  }
+}
+
+Blockly.setLocale(localeMessages)
+
+export const getBlocklyStructure = (): BlockState[] | null => {
+  const workspace = Blockly.getMainWorkspace()
+  if (!workspace) return null
+  const blocklyTaskStructure = saveWorkspaceWithoutGhosts(
+    workspace as Blockly.WorkspaceSvg,
+  ).blocks?.blocks
+  if (!blocklyTaskStructure || blocklyTaskStructure.length === 0) return null
+  return blocklyTaskStructure as BlockState[]
+}
+
+// Blockly's workspace-level Collapse/Expand Blocks are removed rather than
+// relabelled. They collapse EVERY block in every next-chain, while the two
+// affordances we keep — "Compact block" on a block and "Compact all" in the
+// editor's overflow menu — collapse only blocks with a statement body, so the
+// main chain stays readable. Renaming them would leave two behaviours behind
+// one word; and unlike the block menu, the workspace menu is passed through
+// unfiltered (editor/contextMenu.ts), so there was nowhere else to scope them.
+// blockHelp goes for an unrelated reason: no block defines a help URL.
+const REMOVED_CONTEXT_MENU_ITEMS = [
+  'blockHelp',
+  'collapseWorkspace',
+  'expandWorkspace',
+]
+
+const disableContextMenuItems = () => {
+  for (const id of REMOVED_CONTEXT_MENU_ITEMS) {
+    if (Blockly.ContextMenuRegistry.registry.getItem(id))
+      Blockly.ContextMenuRegistry.registry.unregister(id)
+  }
+}
+
+/**
+ * Mark an unfilled slot as the one currently under the cursor.
+ *
+ * Blockly's own `.blocklyActiveFocus` class was the obvious hook and does not
+ * work here: reaching a shadow block redirects focus to its nearest non-shadow
+ * parent (see BlockSvg.showContextMenu), so the placeholder itself never
+ * carries the class. Without this the keyboard user sees no difference between
+ * the slot they are on and every other empty slot, while a mouse user gets the
+ * highlight for free when the picker opens.
+ *
+ * A class of its own rather than reusing `shadow-block--selected`: that one is
+ * owned by the picker's open/close lifecycle (useShadowPicker removes it on
+ * close), and toggling it from here too would let a selection change strip the
+ * highlight off a slot whose picker is still open.
+ */
+const markShadowFocus = (block: Blockly.BlockSvg, on: boolean) => {
+  if (!block.isShadow()) return
+  block.getSvgRoot?.()?.classList.toggle('shadow-block--focused', on)
+}
+
+const enableChainSelection = (workspace: Blockly.WorkspaceSvg) => {
+  let syncingSelection = false
+
+  const listener = (event: Blockly.Events.Abstract) => {
+    if (`${event.type}` !== `${Blockly.Events.SELECTED}`) return
+    if (syncingSelection) return
+
+    const selectedEvent = event as Blockly.Events.Selected
+    syncingSelection = true
+
+    try {
+      if (selectedEvent.oldElementId) {
+        const oldBlock = workspace.getBlockById(selectedEvent.oldElementId)
+        if (oldBlock instanceof Blockly.BlockSvg) {
+          getOwnBodyDescendants(oldBlock).forEach((b) => b.removeSelect())
+          markShadowFocus(oldBlock, false)
+        }
+      }
+      if (selectedEvent.newElementId) {
+        const newBlock = workspace.getBlockById(selectedEvent.newElementId)
+        if (newBlock instanceof Blockly.BlockSvg) {
+          getOwnBodyDescendants(newBlock).forEach((b) => b.addSelect())
+          markShadowFocus(newBlock, true)
+        }
+      }
+    } finally {
+      syncingSelection = false
+    }
+  }
+
+  workspace.addChangeListener(listener)
+  return () => workspace.removeChangeListener(listener)
+}
+
+interface BlocklyComponentProps {
+  dataTask: BlockState | BlockState[] | null
+  editMode: boolean
+  pendingExternalTask?: BlockState | BlockState[] | null
+  onWorkspaceReady?: (workspace: Blockly.WorkspaceSvg | null) => void
+  applyExternalTaskState?: boolean
+  onExternalTaskStateApplied?: () => void
+  onTaskLoaded?: () => void
+}
+
+const DEFAULT_X_AXIS = 200
+const DEFAULT_Y_AXIS = 100
+
+export const BlocklyWorkspace = ({
+  dataTask,
+  editMode,
+  pendingExternalTask,
+  onWorkspaceReady,
+  applyExternalTaskState = false,
+  onExternalTaskStateApplied,
+  onTaskLoaded,
+}: BlocklyComponentProps) => {
+  const blocklyDivRef = useRef<HTMLDivElement | null>(null)
+  const primaryWorkspaceRef = useRef<Blockly.WorkspaceSvg | null>(null)
+
+  const onWorkspaceReadyRef = useRef(onWorkspaceReady)
+  useEffect(() => {
+    onWorkspaceReadyRef.current = onWorkspaceReady
+  })
+
+  const onExternalTaskStateAppliedRef = useRef(onExternalTaskStateApplied)
+  useEffect(() => {
+    onExternalTaskStateAppliedRef.current = onExternalTaskStateApplied
+  })
+
+  const onTaskLoadedRef = useRef(onTaskLoaded)
+  useEffect(() => {
+    onTaskLoadedRef.current = onTaskLoaded
+  })
+
+  /**
+   * Names the cause when the workspace is torn down and rebuilt.
+   *
+   * The effect below disposes the whole Blockly instance and injects a new one
+   * whenever `editMode` or `dataTask` changes identity. On screen that is
+   * indistinguishable from a page refresh: the blocks vanish and come back
+   * from data, and anything not yet saved goes with them.
+   *
+   * Both are supposed to be stable — `dataTask` is `editorDataTask` in
+   * task-workspace, which is assigned once and cleared only by Discard — but
+   * that invariant lives in another file and nothing enforces it. A `useMemo`
+   * losing its identity there, or a new caller passing a fresh object, would
+   * silently turn every render into a rebuild, and the report reaching a
+   * developer would be "the workspace refreshes at random".
+   *
+   * Dev only, and it prints WHICH dependency moved, because the two have very
+   * different causes: `editMode` follows read-only state, `dataTask` follows
+   * the fetched task.
+   */
+  const injectionCountRef = useRef(0)
+  const lastDepsRef = useRef<{ editMode: boolean; dataTask: unknown } | null>(
+    null,
+  )
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      injectionCountRef.current += 1
+      const previous = lastDepsRef.current
+      if (previous) {
+        const changed = [
+          previous.editMode !== editMode && 'editMode',
+          previous.dataTask !== dataTask && 'dataTask',
+        ].filter(Boolean)
+        console.warn(
+          `[BlocklyWorkspace] rebuilt (#${injectionCountRef.current}) — ` +
+            `changed: ${changed.join(', ') || 'neither: the component remounted'}`,
+        )
+      }
+      lastDepsRef.current = { editMode, dataTask }
+    }
+
+    if (blocklyDivRef.current) {
+      blocklyDivRef.current.innerHTML = ''
+    }
+
+    const blocklyDivCurrent = blocklyDivRef.current as Element
+    const workspaceConfig: Blockly.BlocklyOptions = {
+      ...INTERACTIVE_WORKSPACE_CONFIG,
+      readOnly: !editMode,
+    }
+
+    primaryWorkspaceRef.current = Blockly.inject(blocklyDivCurrent, {
+      ...workspaceConfig,
+      disable: true,
+    })
+
+    let resizeObserver: ResizeObserver | null = null
+    let detachChainSelection: (() => void) | null = null
+    let detachGhostListener: (() => void) | null = null
+
+    if (primaryWorkspaceRef.current) {
+      disableContextMenuItems()
+      const workspace = primaryWorkspaceRef.current
+      detachChainSelection = enableChainSelection(workspace)
+      detachGhostListener = registerGhostRestoreListener(workspace)
+
+      onWorkspaceReadyRef.current?.(workspace)
+
+      if (isValidBlockState(dataTask)) {
+        Blockly.Events.disable()
+        try {
+          if (Array.isArray(dataTask)) {
+            dataTask.forEach((block) => {
+              const defaultDataTask = { ...block }
+              defaultDataTask.x = block.x ?? DEFAULT_X_AXIS
+              defaultDataTask.y = block.y ?? DEFAULT_Y_AXIS
+              Blockly.serialization.blocks.append(defaultDataTask, workspace)
+            })
+          } else {
+            let defaultDataTask = { ...dataTask }
+            if (defaultDataTask.type !== 'when_start') {
+              defaultDataTask = {
+                type: 'when_start',
+                x: DEFAULT_X_AXIS,
+                y: DEFAULT_Y_AXIS,
+                next: {
+                  block: defaultDataTask,
+                },
+              }
+            } else {
+              defaultDataTask.x = dataTask?.x ?? DEFAULT_X_AXIS
+              defaultDataTask.y = dataTask?.y ?? DEFAULT_Y_AXIS
+            }
+            Blockly.serialization.blocks.append(defaultDataTask, workspace)
+          }
+          injectAllGhostBlocks(workspace)
+        } finally {
+          Blockly.Events.enable()
+        }
+
+        onTaskLoadedRef.current?.()
+      } else {
+        onTaskLoadedRef.current?.()
+      }
+
+      if (blocklyDivCurrent) {
+        resizeObserver = new ResizeObserver(() => {
+          if (primaryWorkspaceRef.current) {
+            Blockly.svgResize(primaryWorkspaceRef.current)
+          }
+        })
+        resizeObserver.observe(blocklyDivCurrent)
+      }
+    }
+
+    return () => {
+      resizeObserver?.disconnect()
+      detachChainSelection?.()
+      detachGhostListener?.()
+      onWorkspaceReadyRef.current?.(null)
+
+      if (primaryWorkspaceRef.current) {
+        primaryWorkspaceRef.current.dispose()
+        primaryWorkspaceRef.current = null
+      }
+    }
+  }, [editMode, dataTask])
+
+  useEffect(() => {
+    if (!applyExternalTaskState) return
+    if (!primaryWorkspaceRef.current) {
+      console.error(
+        'External task state was ready to apply but the Blockly workspace is not injected yet',
+      )
+      return
+    }
+    if (!isValidBlockState(pendingExternalTask)) {
+      console.error(
+        'External task state was ready to apply but pendingExternalTask is not a valid block state',
+        pendingExternalTask,
+      )
+      return
+    }
+
+    const workspace = primaryWorkspaceRef.current
+    const blocklyTaskStructure = getBlocklyStructure()
+    const firstBlock = Array.isArray(blocklyTaskStructure)
+      ? blocklyTaskStructure[0]
+      : blocklyTaskStructure
+    const x_axis = firstBlock?.x ?? DEFAULT_X_AXIS
+    const y_axis = firstBlock?.y ?? DEFAULT_Y_AXIS
+
+    updateStructureAndFireFakeChangeEvent(
+      workspace,
+      pendingExternalTask,
+      x_axis,
+      y_axis,
+    )
+
+    onTaskLoadedRef.current?.()
+    onExternalTaskStateAppliedRef.current?.()
+  }, [applyExternalTaskState, pendingExternalTask])
+
+  return (
+    <div
+      ref={blocklyDivRef}
+      id="blocklyDiv"
+      // The "Skip to blocks workspace" link (BlocklyEditor.tsx) targets this
+      // id — without tabIndex, a plain div can't receive focus, so the link
+      // would scroll here but leave keyboard focus behind on the page.
+      tabIndex={-1}
+      style={{ width: '100%', height: '100%', position: 'relative' }}
+    />
+  )
+}

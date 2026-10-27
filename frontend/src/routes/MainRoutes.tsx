@@ -1,13 +1,15 @@
 import React, { lazy } from 'react'
-import { RouteObject } from 'react-router-dom'
+import { Navigate, RouteObject } from 'react-router-dom'
 
 import { Loadable } from 'components/Loadable'
 import { MainLayout } from 'layout/MainLayout'
 import { defaultPath } from 'utils/constants'
+
 import { ProtectedRoute } from './ProtectedRoute'
 
 const ListTasks = Loadable(lazy(() => import('pages/tasks/listTasks')))
 const DetailTask = Loadable(lazy(() => import('pages/tasks/detailTask')))
+const UnifiedWorkspace = Loadable(lazy(() => import('pages/task-workspace')))
 const ListObjects = Loadable(lazy(() => import('pages/objects/listObjects')))
 const DetailObject = Loadable(lazy(() => import('pages/objects/detailObject')))
 const ListLocations = Loadable(
@@ -22,11 +24,8 @@ const ListMyRobots = Loadable(lazy(() => import('pages/myrobots/listMyRobots')))
 const DetailMyRobot = Loadable(
   lazy(() => import('pages/myrobots/detailMyRobot')),
 )
-const Chat = Loadable(lazy(() => import('pages/chat')))
-const Graphic = Loadable(lazy(() => import('pages/graphic')))
-const Multimodal = Loadable(lazy(() => import('pages/multimodal')))
-const Homepage = Loadable(lazy(() => import('pages/homepage')))
 const Faq = Loadable(lazy(() => import('pages/faq')))
+const PageNotFound = Loadable(lazy(() => import('pages/pageNotFound')))
 
 export const MainRoutes: RouteObject = {
   path: defaultPath,
@@ -37,10 +36,11 @@ export const MainRoutes: RouteObject = {
   ),
   children: [
     {
+      // Dashboard-first: / redirects to /tasks
       path: defaultPath,
       element: (
         <ProtectedRoute>
-          <Homepage />
+          <Navigate to="/tasks" replace />
         </ProtectedRoute>
       ),
     },
@@ -61,7 +61,26 @@ export const MainRoutes: RouteObject = {
       ),
     },
     {
+      // Legacy detail route — kept for backward compat
       path: 'task/:id',
+      element: (
+        <ProtectedRoute>
+          <UnifiedWorkspace />
+        </ProtectedRoute>
+      ),
+    },
+    {
+      // New task draft
+      path: 'task/new',
+      element: (
+        <ProtectedRoute>
+          <UnifiedWorkspace />
+        </ProtectedRoute>
+      ),
+    },
+    {
+      // Task metadata / details form
+      path: 'task/:id/details',
       element: (
         <ProtectedRoute>
           <DetailTask />
@@ -133,26 +152,13 @@ export const MainRoutes: RouteObject = {
       ),
     },
     {
-      path: 'chat/:id',
+      // Authenticated catch-all — without this, an unknown path under a
+      // logged-in session fell through to AuthRoutes' wildcard and rendered
+      // the 404 page in the bare unauthenticated layout, without app chrome.
+      path: '*',
       element: (
         <ProtectedRoute>
-          <Chat />
-        </ProtectedRoute>
-      ),
-    },
-    {
-      path: 'graphic/:id',
-      element: (
-        <ProtectedRoute>
-          <Graphic />
-        </ProtectedRoute>
-      ),
-    },
-    {
-      path: 'multimodal/:id',
-      element: (
-        <ProtectedRoute>
-          <Multimodal />
+          <PageNotFound />
         </ProtectedRoute>
       ),
     },

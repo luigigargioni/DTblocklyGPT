@@ -1,4 +1,4 @@
-import React, { JSX, useEffect, useState } from 'react'
+import React, { JSX, useCallback, useEffect, useState } from 'react'
 import { Navigate } from 'react-router-dom'
 import { useDispatch } from 'react-redux'
 
@@ -19,22 +19,39 @@ interface ProtectedRouteProps {
   children: JSX.Element
 }
 
+interface VerifyTokenResponse {
+  authError?: boolean
+  id: string | number
+  username: string
+  group: USER_GROUP | string
+  versionServer: string
+}
+
 export const ProtectedRoute = ({
   children,
 }: ProtectedRouteProps): JSX.Element => {
-  const [loading, setLoading] = useState(true)
+  const hasStoredUser = Boolean(getFromLocalStorage(LocalStorageKey.USER))
+  const [loading, setLoading] = useState(hasStoredUser)
   const [isAuthenticated, setIsAuthenticated] = useState(false)
 
-  const verifyToken = async () => {
-    return fetchApi({
-      url: endpoints.auth.verifyToken,
-      method: MethodHTTP.POST,
-      body: { id: getFromLocalStorage(LocalStorageKey.USER).id },
-    }).then((res) => {
+  const verifyToken = useCallback(async () => {
+    try {
+      const storedUser = getFromLocalStorage(LocalStorageKey.USER)
+      if (!storedUser?.id) {
+        setIsAuthenticated(false)
+        return
+      }
+
+      const res = await fetchApi<VerifyTokenResponse, { id: string | number }>({
+        url: endpoints.auth.verifyToken,
+        method: MethodHTTP.POST,
+        body: { id: storedUser.id },
+      })
+
       removeFromLocalStorage(LocalStorageKey.USER)
-      if (res && !res.authError) {
+      if (!res.authError) {
         const userInfo: UserLoginInterface = {
-          id: res.id,
+          id: String(res.id),
           username: res.username,
           group: res.group as USER_GROUP,
           versionServer: res.versionServer,
@@ -42,17 +59,19 @@ export const ProtectedRoute = ({
         setToLocalStorage(LocalStorageKey.USER, userInfo)
         setIsAuthenticated(true)
       }
+    } catch {
+      setIsAuthenticated(false)
+    } finally {
       setLoading(false)
-    })
-  }
+    }
+  }, [])
 
   useEffect(() => {
-    if (!getFromLocalStorage(LocalStorageKey.USER)) {
-      setLoading(false)
+    if (!hasStoredUser) {
       return
     }
-    verifyToken()
-  }, [])
+    void verifyToken()
+  }, [hasStoredUser, verifyToken])
 
   if (isAuthenticated) return children
   return loading ? <LoadingSpinner /> : <Navigate to="/login" replace />

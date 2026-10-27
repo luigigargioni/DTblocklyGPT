@@ -2,21 +2,23 @@ import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Button,
+  CircularProgress,
   FormControl,
   FormHelperText,
-  Grid,
   IconButton,
   InputAdornment,
   InputLabel,
   OutlinedInput,
   Stack,
   TextField,
+  Typography,
 } from '@mui/material'
 import { string as YupString, object as YupObject } from 'yup'
 import { Formik } from 'formik'
-import { EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons'
-
+import type { FormikHelpers } from 'formik'
+import { Eye, EyeOff } from 'lucide-react'
 import { useDispatch } from 'react-redux'
+
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
 import { USER_GROUP, defaultOpenItem, defaultPath } from 'utils/constants'
 import { fetchApi, MethodHTTP } from 'services/api'
@@ -31,52 +33,51 @@ export interface UserLoginInterface {
   versionServer: string
 }
 
-interface LoginFormProps {
-  setResetPassword: (value: boolean) => void
+interface LoginFormValues {
+  username: string
+  password: string
 }
 
-export const LoginForm = ({ setResetPassword }: LoginFormProps) => {
+interface LoginResponse {
+  authError: boolean
+  username: string
+  id: number
+  group: USER_GROUP
+}
+
+export const LoginForm = () => {
   const [showPassword, setShowPassword] = useState<boolean>(false)
   const navigate = useNavigate()
   const dispatch = useDispatch()
 
-  const onSubmit = async (
-    values: { username: string; password: string },
-    { setErrors, setStatus, setSubmitting },
+  const onSubmit = (
+    values: LoginFormValues,
+    { setStatus, setSubmitting }: FormikHelpers<LoginFormValues>,
   ) => {
-    fetchApi({
+    void fetchApi<LoginResponse, LoginFormValues>({
       url: endpoints.auth.login,
       method: MethodHTTP.POST,
       body: { username: values.username, password: values.password },
     })
-      .then((response: any) => {
-        const {
-          authError,
-          username,
-          id,
-          group,
-        }: { authError: boolean; username: string; id: number; group: string } =
-          response
+      .then((response) => {
+        const { authError, username, id, group } = response
         if (!authError) {
           setToLocalStorage(LocalStorageKey.USER, { username, id, group })
-          navigate(defaultPath)
-          dispatch(activeItem(defaultOpenItem))
+          void navigate(defaultPath)
+          void dispatch(activeItem(defaultOpenItem))
           setStatus({ success: true })
           return
         }
-        setStatus({ success: false })
-
-        if (authError) {
-          setErrors({
-            username: MessageText.invalidCredentials,
-            password: MessageText.invalidCredentials,
-          })
-          return
-        }
-        setErrors({
-          username: MessageText.noConnection,
-          password: MessageText.noConnection,
+        // One form-level message, not the same text duplicated under both
+        // fields — the failure is the username/password combination, not
+        // either field individually.
+        setStatus({
+          success: false,
+          formError: MessageText.invalidCredentials,
         })
+      })
+      .catch(() => {
+        setStatus({ success: false, formError: MessageText.noConnection })
       })
       .finally(() => {
         setSubmitting(false)
@@ -102,110 +103,129 @@ export const LoginForm = ({ setResetPassword }: LoginFormProps) => {
         handleChange,
         handleSubmit,
         isSubmitting,
+        status,
         touched,
         values,
       }) => (
         <form noValidate onSubmit={handleSubmit}>
-          <Grid container spacing={3}>
-            <Grid size={12}>
-              <Stack spacing={1}>
-                <TextField
-                  id="username-login"
-                  type="username"
-                  value={values.username}
-                  name="username"
-                  label="Username"
+          <Stack spacing={2.5}>
+            <Stack spacing={1}>
+              <TextField
+                id="username-login"
+                type="text"
+                autoComplete="username"
+                required
+                value={values.username}
+                name="username"
+                label="Username"
+                onBlur={handleBlur}
+                onChange={handleChange}
+                fullWidth
+                error={Boolean(touched.username && errors.username)}
+                aria-invalid={Boolean(touched.username && errors.username)}
+                aria-describedby={
+                  touched.username && errors.username
+                    ? 'helper-text-username-login'
+                    : undefined
+                }
+              />
+              {touched.username && errors.username && (
+                <FormHelperText
+                  error
+                  role="alert"
+                  id="helper-text-username-login"
+                  style={{ marginTop: 3 }}
+                >
+                  {errors.username}
+                </FormHelperText>
+              )}
+            </Stack>
+            <Stack spacing={1}>
+              <FormControl>
+                <InputLabel
+                  htmlFor="password-login"
+                  error={Boolean(touched.password && errors.password)}
+                >
+                  Password
+                </InputLabel>
+                <OutlinedInput
+                  fullWidth
+                  required
+                  autoComplete="current-password"
+                  error={Boolean(touched.password && errors.password)}
+                  aria-invalid={Boolean(touched.password && errors.password)}
+                  aria-describedby={
+                    touched.password && errors.password
+                      ? 'helper-text-password-login'
+                      : undefined
+                  }
+                  id="password-login"
+                  type={showPassword ? 'text' : 'password'}
+                  value={values.password}
+                  name="password"
+                  label="Password"
                   onBlur={handleBlur}
                   onChange={handleChange}
-                  fullWidth
-                  error={Boolean(touched.username && errors.username)}
+                  endAdornment={
+                    <InputAdornment position="end">
+                      <IconButton
+                        aria-label="toggle password visibility"
+                        onClick={() => setShowPassword(!showPassword)}
+                        onMouseDown={(e) => e.preventDefault()}
+                        edge="end"
+                        size="large"
+                      >
+                        {showPassword ? (
+                          <Eye size={16} />
+                        ) : (
+                          <EyeOff size={16} />
+                        )}
+                      </IconButton>
+                    </InputAdornment>
+                  }
                 />
-                {touched.username && errors.username && (
+                {touched.password && errors.password && (
                   <FormHelperText
                     error
-                    id="helper-text-username-login"
-                    style={{ marginTop: 3 }}
+                    role="alert"
+                    id="helper-text-password-login"
+                    style={{ margin: 0, marginTop: 3 }}
                   >
-                    {errors.username}
+                    {errors.password}
                   </FormHelperText>
                 )}
-              </Stack>
-            </Grid>
-            <Grid size={12}>
-              <Stack spacing={1}>
-                <FormControl>
-                  <InputLabel
-                    htmlFor="password-login"
-                    error={Boolean(touched.password && errors.password)}
-                  >
-                    Password
-                  </InputLabel>
-                  <OutlinedInput
-                    fullWidth
-                    error={Boolean(touched.password && errors.password)}
-                    id="password-login"
-                    type={showPassword ? 'text' : 'password'}
-                    value={values.password}
-                    name="password"
-                    label="Password"
-                    onBlur={handleBlur}
-                    onChange={handleChange}
-                    endAdornment={
-                      <InputAdornment position="end">
-                        <IconButton
-                          aria-label="toggle password visibility"
-                          onClick={() => setShowPassword(!showPassword)}
-                          onMouseDown={(e) => e.preventDefault()}
-                          edge="end"
-                          size="large"
-                        >
-                          {showPassword ? (
-                            <EyeOutlined />
-                          ) : (
-                            <EyeInvisibleOutlined />
-                          )}
-                        </IconButton>
-                      </InputAdornment>
-                    }
-                  />
-                  {touched.password && errors.password && (
-                    <FormHelperText
-                      error
-                      id="helper-text-password-login"
-                      style={{ margin: 0, marginTop: 3 }}
-                    >
-                      {errors.password}
-                    </FormHelperText>
-                  )}
-                </FormControl>
-              </Stack>
-            </Grid>
-            <Grid size={12}>
-              <Button
-                disableElevation
-                disabled={isSubmitting}
-                fullWidth
-                size="large"
-                type="submit"
-                variant="contained"
-                color="primary"
-              >
-                Login
-              </Button>
-            </Grid>
-            <Grid size={12} sx={{ display: 'none' }}>
-              <Button
-                fullWidth
-                size="small"
-                variant="text"
-                color="primary"
-                onClick={() => setResetPassword(true)}
-                disabled
-              >
-                Forgot the password?
-              </Button>
-            </Grid>
-          </Grid>
+              </FormControl>
+            </Stack>
+            {status?.success === false && status.formError && (
+              <FormHelperText error role="alert" sx={{ textAlign: 'center' }}>
+                {status.formError}
+              </FormHelperText>
+            )}
+            <Button
+              disableElevation
+              disabled={isSubmitting}
+              fullWidth
+              size="large"
+              type="submit"
+              variant="contained"
+              color="primary"
+              startIcon={
+                isSubmitting ? (
+                  <CircularProgress size={16} color="inherit" />
+                ) : undefined
+              }
+              sx={{
+                borderRadius: '8px',
+                textTransform: 'none',
+                fontWeight: 600,
+              }}
+            >
+              {isSubmitting ? 'Signing in…' : 'Login'}
+            </Button>
+            <Typography variant="body2" color="text.secondary" align="center">
+              Forgot your password? Ask your administrator to reset it.
+            </Typography>
+          </Stack>
         </form>
       )}
     </Formik>

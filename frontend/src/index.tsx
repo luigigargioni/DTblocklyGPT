@@ -2,23 +2,29 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import { Provider as ReduxProvider } from 'react-redux'
-// import { LocalizationProvider } from '@mui/x-date-pickers'
-// import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs'
 import { SWRConfig } from 'swr'
-import { ConfigProvider } from 'antd'
-import enGB from 'antd/locale/en_GB'
-import 'dayjs/locale/en-gb'
-import 'antd/dist/reset.css'
-
 import { locale } from 'dayjs'
+import 'dayjs/locale/en-gb'
+
 import { swrParams } from 'services/api'
+import { ErrorBoundary } from 'components/ErrorBoundary'
 import { ToastContainerStyled } from 'components/ToastContainer'
 import ThemeCustomization from 'themes'
 import { Routes } from 'routes'
-import { antdTheme } from 'themes/theme'
+
 import { store } from './store'
-import 'regenerator-runtime'
-import '@ant-design/v5-patch-for-react-19'
+
+// ─── Geist font — Vercel OSS, 2023 (design system primary font) ──────────────
+// Self-hosted via @fontsource, not the render-blocking Google Fonts @import
+// (which would load Geist twice).
+import '@fontsource/geist/400.css'
+import '@fontsource/geist/500.css'
+import '@fontsource/geist/600.css'
+import '@fontsource/geist/700.css'
+import '@fontsource/geist-mono/400.css'
+import '@fontsource/geist-mono/500.css'
+import '@fontsource/geist-mono/600.css'
+import '@fontsource/geist-mono/700.css'
 
 locale('en-gb')
 
@@ -29,14 +35,16 @@ root.render(
   <ReduxProvider store={store}>
     <BrowserRouter>
       <SWRConfig value={swrParams}>
-        <ConfigProvider locale={enGB} theme={antdTheme}>
-          {/* <LocalizationProvider dateAdapter={AdapterDayjs} adapterLocale="en"> */}
-          <ThemeCustomization>
+        <ThemeCustomization>
+          {/* Inside ThemeCustomization so the fallback is themed, and around
+              Routes so it covers every lazily-loaded page — a rejected chunk
+              import is thrown past Loadable's Suspense, which only handles the
+              pending state. */}
+          <ErrorBoundary>
             <Routes />
-          </ThemeCustomization>
-          <ToastContainerStyled />
-          {/* </LocalizationProvider> */}
-        </ConfigProvider>
+          </ErrorBoundary>
+        </ThemeCustomization>
+        <ToastContainerStyled />
       </SWRConfig>
     </BrowserRouter>
   </ReduxProvider>,

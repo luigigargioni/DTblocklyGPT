@@ -1,5 +1,20 @@
+/**
+ * objects (name, keywords, physical dimensions and weight used by the grasp planner)
+ *
+ * One of six sibling CRUD forms (pages/{objects,actions,locations,robots,users,myrobots}/form*.tsx)
+ * that all share the same shape: Formik state + a yup schema, submitted through
+ * `fetchApi` from services/api.ts.
+ *
+ * The one part that is not boilerplate is the duplicate-name branch. `fetchApi`
+ * RESOLVES on 400/409 instead of rejecting (see the LANDMINE comment in
+ * services/api.ts), so a name collision arrives as a normal `.then()` carrying
+ * a flag in the payload — never as a `.catch()`. These forms therefore inspect
+ * the response body and push the error onto the field with `setFieldError`.
+ * Reading the collision from a rejected promise would silently never fire.
+ */
 import React from 'react'
 import {
+  Alert,
   Button,
   CardMedia,
   Checkbox,
@@ -20,15 +35,17 @@ import {
   Typography,
 } from '@mui/material'
 import { Formik } from 'formik'
+import type { FormikHelpers } from 'formik'
 import { toast } from 'react-toastify'
 import { string as YupString, object as YupObject } from 'yup'
-import { AimOutlined, PlusOutlined } from '@ant-design/icons'
+import { Crosshair, Plus } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
 import { MyRobotType } from 'pages/myrobots/types'
-import { useSearchParams } from 'react-router-dom'
+
 import { ObjectDetailType } from './types'
 
 interface FormObjectProps {
@@ -36,119 +53,160 @@ interface FormObjectProps {
   dataMyRobots: MyRobotType[] | undefined
   insertMode: boolean
   backFunction: () => void
+  readOnly?: boolean
+  ownerUsername?: string
 }
+
+interface ObjectFormValues extends ObjectDetailType {
+  robot: number | '' | null
+}
+
+interface SaveObjectResponse {
+  nameAlreadyExists?: boolean
+  keywordExist?: boolean
+  keywordFound?: string[]
+}
+
+interface CartesianPositionResponse {
+  position?: {
+    Z?: number
+  }
+}
+
+interface ObjectPhotoResponse {
+  photo?: string
+  contour?: string
+  shape?: string
+}
+
+type SetFieldValue = FormikHelpers<ObjectFormValues>['setFieldValue']
+type SetFieldError = FormikHelpers<ObjectFormValues>['setFieldError']
+type SetFieldTouched = FormikHelpers<ObjectFormValues>['setFieldTouched']
 
 export const FormObject = ({
   dataObject,
   dataMyRobots,
   insertMode,
   backFunction,
+  readOnly = false,
+  ownerUsername,
 }: FormObjectProps) => {
   const [addKeyword, setAddKeyword] = React.useState<string>('')
   const [keywordErrors, setKeywordErrors] = React.useState<string[]>([])
   const [searchParams] = useSearchParams()
   const forcedName = searchParams.get('forcedName')
-  // const [acquiredPhoto, setAcquiredPhoto] = React.useState<boolean>(false)
 
-  const onSubmit = async (
-    values: ObjectDetailType,
-    { setStatus, setSubmitting, setFieldError, setFieldTouched },
+  const onSubmit = (
+    values: ObjectFormValues,
+    {
+      setStatus,
+      setSubmitting,
+      setFieldError,
+      setFieldTouched,
+    }: FormikHelpers<ObjectFormValues>,
   ) => {
+    if (readOnly) return
     const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
     setKeywordErrors([])
-    fetchApi({ url: endpoints.home.libraries.object, method, body: values })
-      .then(async (res) => {
-        if (res && res.nameAlreadyExists) {
-          await setFieldTouched('name', true)
-          await setFieldError('name', MessageText.alreadyExists)
+    void fetchApi<SaveObjectResponse, ObjectFormValues>({
+      url: endpoints.home.libraries.object,
+      method,
+      body: values,
+    })
+      .then((res) => {
+        if (res?.nameAlreadyExists) {
+          void setFieldTouched('name', true)
+          setFieldError('name', MessageText.alreadyExists)
           setStatus({ success: false })
           return
         }
-        if (res && res.keywordExist) {
-          setKeywordErrors(res.keywordFound)
+
+        if (res?.keywordExist) {
+          setKeywordErrors(
+            Array.isArray(res.keywordFound) ? res.keywordFound : [],
+          )
           setStatus({ success: false })
           return
         }
+
         setStatus({ success: true })
         toast.success(MessageText.success)
         backFunction()
+      })
+      .catch(() => {
+        setStatus({ success: false })
       })
       .finally(() => {
         setSubmitting(false)
       })
   }
 
-  const handleGetHeight = async (
-    robot: number | null,
-    setFieldValue: (field: string, value: any) => void,
-    setFieldError: (field: string, value: any) => void,
-    setFieldTouched: (field: string, touched: any) => void,
+  const handleGetHeight = (
+    robot: ObjectFormValues['robot'],
+    setFieldValue: SetFieldValue,
+    setFieldError: SetFieldError,
+    setFieldTouched: SetFieldTouched,
   ) => {
     if (!robot) {
-      await setFieldTouched('robot', true)
-      await setFieldError('robot', MessageText.requiredField)
+      void setFieldTouched('robot', true)
+      setFieldError('robot', MessageText.requiredField)
       return
     }
 
-    // Mock data
-    // setFieldValue('height', 10)
-
-    fetchApi({
+    void fetchApi<CartesianPositionResponse, { robot: number }>({
       url: endpoints.home.libraries.getCartesianPosition,
       method: MethodHTTP.POST,
-      body: { robot },
-    }).then((response) => {
-      if (response) {
-        setFieldValue('height', response.position.Z)
-        toast.success('Height acquired')
-      }
+      body: { robot: Number(robot) },
     })
+      .then((response) => {
+        if (typeof response?.position?.Z === 'number') {
+          void setFieldValue('height', response.position.Z)
+          toast.success('Height acquired')
+        }
+      })
+      .catch(() => {
+        // fetchApi already surfaces a toast for the failure.
+      })
   }
 
-  const handleGetPhoto = async (
-    robot: number | null,
-    setFieldValue: (field: string, value: any) => void,
-    setFieldError: (field: string, value: any) => void,
-    setFieldTouched: (
-      field: string,
-      isTouched: boolean,
-      shouldValidate: boolean,
-    ) => void,
+  const handleGetPhoto = (
+    robot: ObjectFormValues['robot'],
+    setFieldValue: SetFieldValue,
+    setFieldError: SetFieldError,
+    setFieldTouched: SetFieldTouched,
   ) => {
     if (!robot) {
-      await setFieldTouched('robot', true, true)
-      await setFieldError('robot', MessageText.requiredField)
+      void setFieldTouched('robot', true, true)
+      setFieldError('robot', MessageText.requiredField)
       return
     }
 
-    // Mock data
-    /*
-    setAcquiredPhoto(true)
-    setFieldValue('photo', '/test_image/grid_photo.png')
-    setFieldValue('contour', '/test_image/grid_contour.png')
-    setFieldValue('shape', '/test_image/grid_shape.png')
-    */
-
-    fetchApi({
+    void fetchApi<ObjectPhotoResponse, { robot: number }>({
       url: endpoints.home.libraries.getPhoto,
       method: MethodHTTP.POST,
-      body: { robot },
-    }).then((response) => {
-      if (response) {
-        setFieldValue('photo', response.photo)
-        setFieldValue('contour', response.contour)
-        setFieldValue('shape', response.shape)
-        toast.success('Photo acquired')
-      }
+      body: { robot: Number(robot) },
     })
+      .then((response) => {
+        if (response) {
+          void setFieldValue('photo', response.photo || '')
+          void setFieldValue('contour', response.contour || '')
+          void setFieldValue('shape', response.shape || '')
+          toast.success('Photo acquired')
+        }
+      })
+      .catch(() => {
+        // fetchApi already surfaces a toast for the failure.
+      })
   }
 
   return (
-    <Formik
+    <Formik<ObjectFormValues>
       initialValues={{
         id: dataObject?.id || -1,
         name: forcedName || dataObject?.name || '',
         shared: dataObject?.shared || false,
+        owner: dataObject?.owner ?? -1,
+        owner__username: dataObject?.owner__username ?? '',
         height: dataObject?.height || 0,
         keywords: dataObject?.keywords || [],
         robot: null,
@@ -179,14 +237,15 @@ export const FormObject = ({
         setFieldError,
         setFieldTouched,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
+        <form noValidate onSubmit={handleSubmit}>
           <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
+            {readOnly && (
+              <Grid size={12}>
+                <Alert severity="info">
+                  Shared by {ownerUsername ?? 'another user'} — read-only
+                </Alert>
+              </Grid>
+            )}
             <Grid size={2}>
               <Stack spacing={1}>
                 <TextField
@@ -194,14 +253,19 @@ export const FormObject = ({
                   value={values.name || ''}
                   name="name"
                   label="Name"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
-                  disabled={!!forcedName}
+                  disabled={!!forcedName || readOnly}
                   error={Boolean(touched.name && errors.name)}
+                  aria-invalid={Boolean(touched.name && errors.name)}
+                  aria-describedby={
+                    touched.name && errors.name ? 'helper-text-name' : undefined
+                  }
                   title="Name of the object"
                 />
                 {touched.name && errors.name && (
-                  <FormHelperText error id="helper-text-name">
+                  <FormHelperText error role="alert" id="helper-text-name">
                     {errors.name}
                   </FormHelperText>
                 )}
@@ -216,8 +280,11 @@ export const FormObject = ({
                       value={values.shared}
                       name="shared"
                       onBlur={handleBlur}
-                      onChange={() => setFieldValue('shared', !values.shared)}
+                      onChange={() => {
+                        void setFieldValue('shared', !values.shared)
+                      }}
                       checked={values.shared}
+                      disabled={readOnly}
                     />
                   }
                   label="Shared"
@@ -236,13 +303,15 @@ export const FormObject = ({
                   name="add_keyword"
                   label="Add keyword"
                   title="You can define keywords for this object to be used as synonyms during the chat"
+                  disabled={readOnly}
                   onChange={(e) => setAddKeyword(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
+                      e.preventDefault()
                       if (addKeyword) {
                         const newKeywords = [...values.keywords]
                         newKeywords.push(addKeyword)
-                        setFieldValue('keywords', newKeywords)
+                        void setFieldValue('keywords', newKeywords)
                         setAddKeyword('')
                       }
                     }
@@ -256,17 +325,19 @@ export const FormObject = ({
                               if (addKeyword) {
                                 const newKeywords = [...values.keywords]
                                 newKeywords.push(addKeyword)
-                                setFieldValue('keywords', newKeywords)
+                                void setFieldValue('keywords', newKeywords)
                                 setAddKeyword('')
                               }
                             }}
                             disabled={
+                              readOnly ||
                               !addKeyword ||
                               values.keywords.includes(addKeyword)
                             }
                             edge="end"
+                            aria-label="Add keyword"
                           >
-                            <PlusOutlined />
+                            <Plus size={16} />
                           </IconButton>
                         </InputAdornment>
                       ),
@@ -282,16 +353,20 @@ export const FormObject = ({
                     key={keyword}
                     label={keyword}
                     variant="outlined"
-                    onDelete={() => {
-                      const newKeywords = [...values.keywords]
-                      newKeywords.splice(index, 1)
-                      setFieldValue('keywords', newKeywords)
+                    onDelete={
+                      readOnly
+                        ? undefined
+                        : () => {
+                            const newKeywords = [...values.keywords]
+                            newKeywords.splice(index, 1)
+                            void setFieldValue('keywords', newKeywords)
 
-                      const newKeywordErrors = keywordErrors.filter(
-                        (keywordError) => keywordError !== keyword,
-                      )
-                      setKeywordErrors(newKeywordErrors)
-                    }}
+                            const newKeywordErrors = keywordErrors.filter(
+                              (keywordError) => keywordError !== keyword,
+                            )
+                            setKeywordErrors(newKeywordErrors)
+                          }
+                    }
                     color={
                       keywordErrors.includes(keyword) ? 'error' : 'primary'
                     }
@@ -314,8 +389,15 @@ export const FormObject = ({
                     name="robot"
                     onBlur={handleBlur}
                     onChange={handleChange}
+                    disabled={readOnly}
                     error={Boolean(touched.robot && errors.robot)}
-                    title="Robot use to acquire height and photo"
+                    aria-invalid={Boolean(touched.robot && errors.robot)}
+                    aria-describedby={
+                      touched.robot && errors.robot
+                        ? 'helper-text-robot'
+                        : undefined
+                    }
+                    title="Robot used to acquire height and photo"
                   >
                     {dataMyRobots?.map((myRobot) => (
                       <MenuItem value={myRobot.id} key={myRobot.id}>
@@ -324,7 +406,7 @@ export const FormObject = ({
                     ))}
                   </Select>
                   {touched.robot && errors.robot && (
-                    <FormHelperText error id="helper-text-robot">
+                    <FormHelperText error role="alert" id="helper-text-robot">
                       {errors.robot}
                     </FormHelperText>
                   )}
@@ -346,8 +428,9 @@ export const FormObject = ({
                   aria-label="detail"
                   size="medium"
                   variant="outlined"
+                  disabled={readOnly}
                   title="Define the height of the object"
-                  startIcon={<AimOutlined style={{ fontSize: '2em' }} />}
+                  startIcon={<Crosshair size={20} />}
                 >
                   Get height
                 </Button>
@@ -391,6 +474,7 @@ export const FormObject = ({
                   }}
                   onBlur={handleBlur}
                   onChange={handleChange}
+                  disabled={readOnly}
                   error={Boolean(touched.weight && errors.weight)}
                   title="Weight of the object in grams"
                 />
@@ -418,6 +502,7 @@ export const FormObject = ({
                   }}
                   onBlur={handleBlur}
                   onChange={handleChange}
+                  disabled={readOnly}
                   error={Boolean(touched.obj_length && errors.obj_length)}
                   title="Length of the object in millimeters"
                 />
@@ -445,6 +530,7 @@ export const FormObject = ({
                   }}
                   onBlur={handleBlur}
                   onChange={handleChange}
+                  disabled={readOnly}
                   error={Boolean(touched.obj_width && errors.obj_width)}
                   title="Width of the object in millimeters"
                 />
@@ -477,6 +563,7 @@ export const FormObject = ({
                   }}
                   aria-label="Force"
                   onChange={handleChange}
+                  disabled={readOnly}
                   valueLabelDisplay="auto"
                   step={1}
                   marks
@@ -504,15 +591,20 @@ export const FormObject = ({
                   aria-label="detail"
                   size="medium"
                   variant="outlined"
+                  disabled={readOnly}
                   title="Acquire photo of the object to recognize the shape"
-                  startIcon={<AimOutlined style={{ fontSize: '2em' }} />}
+                  startIcon={<Crosshair size={20} />}
                 >
                   Get photo
                 </Button>
               </Stack>
             </Grid>
             {values.photo && (
-              <Grid size={4} container direction="column" alignItems="center">
+              <Grid
+                size={4}
+                container
+                sx={{ flexDirection: 'column', alignItems: 'center' }}
+              >
                 <Stack spacing={1}>
                   <CardMedia
                     component="img"
@@ -522,11 +614,6 @@ export const FormObject = ({
                       maxHeight: '500px',
                       border: '1px solid',
                     }}
-                    /*                     image={
-                      acquiredPhoto
-                        ? values.photo
-                        : `data:image/png;base64,${values.photo}`
-                    } */
                     image={`data:image/png;base64,${values.photo}`}
                     alt="Object Photo"
                   />
@@ -534,7 +621,11 @@ export const FormObject = ({
               </Grid>
             )}
             {values.contour && (
-              <Grid size={4} container direction="column" alignItems="center">
+              <Grid
+                size={4}
+                container
+                sx={{ flexDirection: 'column', alignItems: 'center' }}
+              >
                 <Stack spacing={1}>
                   <CardMedia
                     component="img"
@@ -544,11 +635,6 @@ export const FormObject = ({
                       maxHeight: '500px',
                       border: '1px solid',
                     }}
-                    /*                     image={
-                      acquiredPhoto
-                        ? values.contour
-                        : `data:image/png;base64,${values.contour}`
-                    } */
                     image={`data:image/png;base64,${values.contour}`}
                     alt="Object Contour"
                   />
@@ -556,7 +642,11 @@ export const FormObject = ({
               </Grid>
             )}
             {values.shape && (
-              <Grid size={4} container direction="column" alignItems="center">
+              <Grid
+                size={4}
+                container
+                sx={{ flexDirection: 'column', alignItems: 'center' }}
+              >
                 <Stack spacing={1}>
                   <CardMedia
                     component="img"
@@ -566,11 +656,6 @@ export const FormObject = ({
                       maxHeight: '500px',
                       border: '1px solid',
                     }}
-                    /*                     image={
-                      acquiredPhoto
-                        ? values.shape
-                        : `data:image/png;base64,${values.shape}`
-                    } */
                     image={`data:image/png;base64,${values.shape}`}
                     alt="Object Shape"
                   />
@@ -580,13 +665,17 @@ export const FormObject = ({
             <Grid size={12}>
               <Button
                 disableElevation
-                disabled={isSubmitting}
+                disabled={isSubmitting || readOnly}
                 fullWidth
                 size="large"
                 type="submit"
                 variant="contained"
                 color="primary"
-                title="Save this object"
+                title={
+                  readOnly
+                    ? "Shared by another user — you can't edit this"
+                    : 'Save this object'
+                }
               >
                 Save
               </Button>

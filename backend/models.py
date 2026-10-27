@@ -6,8 +6,9 @@ from django.utils.timezone import now
 import json
 
 
-# For update the database and create table
-# poetry run python manage.py makemigrations backend && poetry run python manage.py migrate --run-syncdb
+# ─── Schema update workflow ─────────────────────
+# poetry run python manage.py makemigrations backend --name <name>
+# poetry run python manage.py migrate backend
 
 
 class Action(models.Model):
@@ -41,7 +42,9 @@ class Action(models.Model):
             elif key == "name":
                 response_data[key] = self.name
             elif key == "owner":
-                response_data[key] = self.owner
+                response_data[key] = self.owner_id
+            elif key == "owner__username":
+                response_data[key] = self.owner.username
             elif key == "shared":
                 response_data[key] = self.shared
             elif key == "speed":
@@ -95,7 +98,9 @@ class Object(models.Model):
             elif key == "name":
                 response_data[key] = self.name
             elif key == "owner":
-                response_data[key] = self.owner
+                response_data[key] = self.owner_id
+            elif key == "owner__username":
+                response_data[key] = self.owner.username
             elif key == "shared":
                 response_data[key] = self.shared
             elif key == "photo":
@@ -142,7 +147,9 @@ class Location(models.Model):
             elif key == "name":
                 response_data[key] = self.name
             elif key == "owner":
-                response_data[key] = self.owner
+                response_data[key] = self.owner_id
+            elif key == "owner__username":
+                response_data[key] = self.owner.username
             elif key == "shared":
                 response_data[key] = self.shared
             elif key == "position":
@@ -150,6 +157,27 @@ class Location(models.Model):
             elif key == "keywords":
                 response_data[key] = self.keywords
         return response_data
+
+
+# ─── Constants lifecycle ───────────────────────────────────────────────────────
+
+TASK_TYPE_TASK = "task"
+TASK_TYPE_MACRO = "macro_task"
+
+TASK_TYPE_CHOICES = [
+    (TASK_TYPE_TASK, "Task"),
+    (TASK_TYPE_MACRO, "Macro Task"),
+]
+
+STATUS_DRAFT = "draft"
+STATUS_PUBLISHED = "published"
+STATUS_PUBLISHED_WITH_DRAFT = "published_with_draft"
+
+STATUS_CHOICES = [
+    (STATUS_DRAFT, "Draft"),
+    (STATUS_PUBLISHED, "Published"),
+    (STATUS_PUBLISHED_WITH_DRAFT, "Published with Draft"),
+]
 
 
 class Task(models.Model):
@@ -160,6 +188,42 @@ class Task(models.Model):
     description = models.CharField(max_length=200, default=None, null=True, blank=True)
     last_modified = models.DateTimeField(default=now)
     shared = models.BooleanField(default=False)
+
+    task_type = models.CharField(
+        max_length=20,
+        choices=TASK_TYPE_CHOICES,
+        default=TASK_TYPE_TASK,
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default=STATUS_DRAFT,
+    )
+
+    # Legacy workspace field (pre-lifecycle). Kept for backward compatibility.
+    # Read path fallback only: draft_workspace > published_workspace > workspace > loads(code)
+    workspace = models.JSONField(null=True, blank=True)
+
+    # Immutable snapshot of the last published version (all task types)
+    # Written by publish_task. Used as the stable source for toolbox preview
+    # and block explosion (break-into-steps).
+    published_workspace = models.JSONField(null=True, blank=True)
+
+    # Isolated working draft (all task types)
+    # Written by save_draft. Cleared on publish or discard.
+    # When set, status transitions to published_with_draft.
+    draft_workspace = models.JSONField(null=True, blank=True)
+
+    # SHA-256 (16 char hex) of the serialized published_workspace.
+    # Used to detect mismatches in referenced macro_task_block blocks.
+    signature = models.CharField(max_length=64, blank=True, default="")
+
+    # List of IDs (int) of the tasks this task directly depends on.
+    # Dead field: publish_task() (task_lifecycle.py) never writes it — only
+    # seed_library.py sets it, always to []. Nothing reads it except
+    # to_dict() echoing it back to the API response. No macro dependency
+    # cycle check exists anywhere in the codebase yet.
+    dependencies = models.JSONField(default=list, blank=True)
 
     def to_dict(self, keys):
         response_data = {}
@@ -178,7 +242,24 @@ class Task(models.Model):
                 response_data[key] = self.last_modified
             elif key == "shared":
                 response_data[key] = self.shared
+            elif key == "task_type":
+                response_data[key] = self.task_type
+            elif key == "status":
+                response_data[key] = self.status
+            elif key == "workspace":
+                response_data[key] = self.workspace
+            elif key == "published_workspace":
+                response_data[key] = self.published_workspace
+            elif key == "draft_workspace":
+                response_data[key] = self.draft_workspace
+            elif key == "signature":
+                response_data[key] = self.signature
+            elif key == "dependencies":
+                response_data[key] = self.dependencies
         return response_data
+
+    class Meta:
+        ordering = ["-last_modified"]
 
 
 class Robot(models.Model):

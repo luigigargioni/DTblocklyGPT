@@ -1,3 +1,17 @@
+/**
+ * the operator's own robot instances
+ *
+ * One of six sibling CRUD forms (pages/{objects,actions,locations,robots,users,myrobots}/form*.tsx)
+ * that all share the same shape: Formik state + a yup schema, submitted through
+ * `fetchApi` from services/api.ts.
+ *
+ * The one part that is not boilerplate is the duplicate-name branch. `fetchApi`
+ * RESOLVES on 400/409 instead of rejecting (see the LANDMINE comment in
+ * services/api.ts), so a name collision arrives as a normal `.then()` carrying
+ * a flag in the payload — never as a `.catch()`. These forms therefore inspect
+ * the response body and push the error onto the field with `setFieldError`.
+ * Reading the collision from a rejected promise would silently never fire.
+ */
 import React from 'react'
 import {
   Button,
@@ -11,19 +25,21 @@ import {
   TextField,
 } from '@mui/material'
 import { Formik } from 'formik'
+import type { FormikHelpers } from 'formik'
 import { toast } from 'react-toastify'
 import {
   string as YupString,
   object as YupObject,
   number as YupNumber,
 } from 'yup'
-import { QrcodeOutlined, StopOutlined } from '@ant-design/icons'
+import { Ban, QrCode } from 'lucide-react'
+import { Scanner } from '@yudiel/react-qr-scanner'
 
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
 import { RobotType } from 'pages/robots/types'
-import { QrReader } from 'react-qr-reader'
+
 import { MyRobotDetailType } from './types'
 
 interface FormMyRobotProps {
@@ -31,6 +47,10 @@ interface FormMyRobotProps {
   dataRobots: RobotType[]
   insertMode: boolean
   backFunction: () => void
+}
+
+interface SaveMyRobotResponse {
+  nameAlreadyExists?: boolean
 }
 
 export const FormMyRobot = ({
@@ -41,22 +61,34 @@ export const FormMyRobot = ({
 }: FormMyRobotProps) => {
   const [scanning, setScanning] = React.useState(false)
 
-  const onSubmit = async (
+  const onSubmit = (
     values: MyRobotDetailType,
-    { setStatus, setSubmitting, setFieldError, setFieldTouched },
+    {
+      setStatus,
+      setSubmitting,
+      setFieldError,
+      setFieldTouched,
+    }: FormikHelpers<MyRobotDetailType>,
   ) => {
     const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
-    fetchApi({ url: endpoints.home.libraries.myRobot, method, body: values })
-      .then(async (res) => {
-        if (res && res.nameAlreadyExists) {
-          await setFieldTouched('name', true)
-          await setFieldError('name', MessageText.alreadyExists)
+    void fetchApi<SaveMyRobotResponse, MyRobotDetailType>({
+      url: endpoints.home.libraries.myRobot,
+      method,
+      body: values,
+    })
+      .then((res) => {
+        if (res?.nameAlreadyExists) {
+          void setFieldTouched('name', true)
+          setFieldError('name', MessageText.alreadyExists)
           setStatus({ success: false })
           return
         }
         setStatus({ success: true })
         toast.success(MessageText.success)
         backFunction()
+      })
+      .catch(() => {
+        setStatus({ success: false })
       })
       .finally(() => {
         setSubmitting(false)
@@ -69,6 +101,8 @@ export const FormMyRobot = ({
         id: dataMyRobot?.id || -1,
         name: dataMyRobot?.name || '',
         robot: dataMyRobot?.robot || null,
+        robot__max_load: dataMyRobot?.robot__max_load ?? null,
+        robot__max_open_tool: dataMyRobot?.robot__max_open_tool ?? null,
       }}
       validationSchema={YupObject().shape({
         name: YupString()
@@ -90,13 +124,7 @@ export const FormMyRobot = ({
         setFieldError,
         setFieldTouched,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
+        <form noValidate onSubmit={handleSubmit}>
           <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
             <Grid size={8}>
               <Stack spacing={1}>
@@ -105,13 +133,18 @@ export const FormMyRobot = ({
                   value={values.name || ''}
                   name="name"
                   label="Name"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
                   error={Boolean(touched.name && errors.name)}
+                  aria-invalid={Boolean(touched.name && errors.name)}
+                  aria-describedby={
+                    touched.name && errors.name ? 'helper-text-name' : undefined
+                  }
                   title="Name of your personal robot"
                 />
                 {touched.name && errors.name && (
-                  <FormHelperText error id="helper-text-name">
+                  <FormHelperText error role="alert" id="helper-text-name">
                     {errors.name}
                   </FormHelperText>
                 )}
@@ -120,17 +153,26 @@ export const FormMyRobot = ({
             <Grid size={4}>
               <Stack spacing={1}>
                 <FormControl fullWidth>
-                  <InputLabel id="robot-label">Robot</InputLabel>
+                  <InputLabel id="robot-label" required>
+                    Robot
+                  </InputLabel>
                   <Select
                     labelId="robot-label"
                     id="robot"
                     value={values.robot || ''}
                     label="Robot"
                     name="robot"
+                    required
                     onBlur={handleBlur}
                     onChange={handleChange}
                     error={Boolean(touched.robot && errors.robot)}
-                    title="Select the robot at system level that will be used as your personal robot"
+                    aria-invalid={Boolean(touched.robot && errors.robot)}
+                    aria-describedby={
+                      touched.robot && errors.robot
+                        ? 'helper-text-robot'
+                        : undefined
+                    }
+                    title="Select the robot from the fleet that will be used as your personal robot"
                   >
                     {dataRobots?.map((robot) => (
                       <MenuItem value={robot.id} key={robot.id}>
@@ -139,7 +181,7 @@ export const FormMyRobot = ({
                     ))}
                   </Select>
                   {touched.robot && errors.robot && (
-                    <FormHelperText error id="helper-text-robot">
+                    <FormHelperText error role="alert" id="helper-text-robot">
                       {errors.robot}
                     </FormHelperText>
                   )}
@@ -154,11 +196,7 @@ export const FormMyRobot = ({
                   size="medium"
                   title="Acquire robot ID from webcam"
                   startIcon={
-                    scanning ? (
-                      <StopOutlined style={{ fontSize: '2em' }} />
-                    ) : (
-                      <QrcodeOutlined style={{ fontSize: '2em' }} />
-                    )
+                    scanning ? <Ban size={20} /> : <QrCode size={20} />
                   }
                   onClick={() => setScanning(!scanning)}
                 >
@@ -173,23 +211,20 @@ export const FormMyRobot = ({
                 <Grid size={4} />
                 <Grid size={4}>
                   <Stack spacing={1}>
-                    <QrReader
-                      onResult={async (result) => {
-                        if (result) {
+                    <Scanner
+                      onScan={(result) => {
+                        if (result && result.length > 0) {
                           setScanning(false)
-                          const code = result.getText()
+                          const code = result[0].rawValue
                           if (
                             dataRobots.find(
                               (robot) => robot.id.toString() === code,
                             )
                           ) {
-                            setFieldValue('robot', result.getText())
+                            void setFieldValue('robot', Number(code))
                           } else {
-                            await setFieldTouched('robot', true)
-                            await setFieldError(
-                              'robot',
-                              MessageText.robotIdNotFound,
-                            )
+                            void setFieldTouched('robot', true)
+                            setFieldError('robot', MessageText.robotIdNotFound)
                           }
                         }
                       }}

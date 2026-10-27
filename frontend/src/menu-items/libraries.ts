@@ -1,13 +1,13 @@
-import {
-  SubnodeOutlined,
-  ExperimentOutlined,
-  AimOutlined,
-} from '@ant-design/icons'
+import { Box, MapPin, Zap } from 'lucide-react'
+
 import { MenuItem } from './types'
 
+// MAPPING REFERENCE:
+// - Internal variable/import name: libraries ➔ External group label: LIBRARY
+// - Internal child ID: actions (URL: /actions) ➔ External item label: Skills
 export const libraries: MenuItem = {
-  id: 'libraries',
-  title: 'Libraries',
+  id: 'twin-library',
+  title: 'LIBRARY',
   type: 'group',
   children: [
     {
@@ -15,21 +15,21 @@ export const libraries: MenuItem = {
       title: 'Objects',
       type: 'item',
       url: '/objects',
-      icon: AimOutlined,
+      icon: Box,
     },
     {
       id: 'locations',
       title: 'Locations',
       type: 'item',
       url: '/locations',
-      icon: ExperimentOutlined,
+      icon: MapPin,
     },
     {
       id: 'actions',
-      title: 'Actions',
+      title: 'Skills',
       type: 'item',
       url: '/actions',
-      icon: SubnodeOutlined,
+      icon: Zap,
     },
   ],
 }

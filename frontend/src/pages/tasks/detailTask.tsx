@@ -1,58 +1,55 @@
 import React from 'react'
-import { CircularProgress, Typography } from '@mui/material'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Button, CircularProgress, Stack, Typography } from '@mui/material'
+import { useNavigate, useParams } from 'react-router-dom'
 import useSWR from 'swr'
 import { useDispatch } from 'react-redux'
 
 import { MainCard } from 'components/MainCard'
 import { endpoints } from 'services/endpoints'
 import { activeItem } from 'store/reducers/menu'
-import { FormTask, TypeNewTask } from './formTask'
+import { useDocumentTitle } from 'hooks/useDocumentTitle'
+
+import { FormTask } from './formTask'
 import { TaskDetailType } from './types'
 
 const DetailTask = () => {
+  useDocumentTitle('Edit Task Details')
   const { id } = useParams()
   const navigate = useNavigate()
   const dispatch = useDispatch()
-  const insertMode = id === 'add'
 
-  const [searchParams] = useSearchParams()
-  const type = searchParams.get('type')
-
-  const { data, isLoading } = useSWR<TaskDetailType, Error>(
-    !insertMode ? { url: endpoints.home.libraries.task, body: { id } } : null,
-  )
+  const { data, error, isLoading, mutate } = useSWR<TaskDetailType, Error>({
+    url: endpoints.home.libraries.task,
+    body: { id },
+  })
+  const loadError = !isLoading && !!error
+  const notFound = !isLoading && !error && data === undefined
 
   const backFunction = () => {
     dispatch(activeItem('tasks'))
     navigate('/tasks')
   }
 
-  const titleNewTask =
-    type === TypeNewTask.CHAT
-      ? 'New task with chat'
-      : 'New task with graphic interface'
-
-  const subtitle = insertMode
-    ? 'Here you can define a new task. Stay hover the fields to see the description.'
-    : 'Here you can edit the detail of the task. Stay hover the fields to see the description.'
-
   return (
     <MainCard
-      title={!insertMode ? 'Task detail' : titleNewTask}
-      subtitle={subtitle}
+      title="Edit details"
+      subtitle="Name, description, and sharing for this task."
       backFunction={backFunction}
-      backTitle="Return to the list of tasks"
+      backTitle="Back to Tasks"
     >
-      {isLoading && !insertMode && <CircularProgress />}
-      {data === null && <Typography>Task with ID {id} not found</Typography>}
-      {(data || insertMode) && (
-        <FormTask
-          data={data}
-          insertMode={insertMode}
-          backFunction={backFunction}
-        />
+      {isLoading && <CircularProgress />}
+      {loadError && (
+        <Stack spacing={1.5} sx={{ alignItems: 'center', py: 4 }}>
+          <Typography variant="body2" color="error.dark">
+            Couldn&apos;t load this task. Check your connection and try again.
+          </Typography>
+          <Button size="small" onClick={() => mutate()}>
+            Retry
+          </Button>
+        </Stack>
       )}
+      {notFound && <Typography>Task with ID {id} not found</Typography>}
+      {data && <FormTask data={data} backFunction={backFunction} />}
     </MainCard>
   )
 }

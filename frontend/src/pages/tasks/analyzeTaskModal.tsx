@@ -1,14 +1,41 @@
-import { Modal, Spin } from 'antd'
 import React from 'react'
 import { toast } from 'react-toastify'
+import {
+  FormControl,
+  InputLabel,
+  MenuItem,
+  Select,
+  Alert,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+  Typography,
+  Box,
+  CircularProgress,
+  Stack,
+  Tooltip,
+} from '@mui/material'
+import { CheckCircle2, AlertTriangle, AlertCircle } from 'lucide-react'
+
 import { analyzeAbstractTask, AnalyzerIssue } from 'utils/taskAnalyzer'
-import { AbstractRobot, AbstractTask, TaskType } from './types'
 import { MyRobotType } from 'pages/myrobots/types'
-import { Alert, FormControl, InputLabel, MenuItem, Select } from '@mui/material'
 import { ObjectListType } from 'pages/objects/types'
 import { LocationListType } from 'pages/locations/types'
 import { ActionListType } from 'pages/actions/types'
-import { CheckOutlined, CloseOutlined } from '@ant-design/icons'
+import { fetchApi, MethodHTTP } from 'services/api'
+import { endpoints } from 'services/endpoints'
+import { blocklyToAbstractAll, CustomBlock } from 'utils/blocklyParser'
+import { isBlocklyPayload } from 'utils/blocklyPayload'
+
+import {
+  AbstractRobot,
+  AbstractStep,
+  AbstractTask,
+  TaskDetailType,
+  TaskType,
+} from './types'
 
 interface AnalyzeTaskModalProps {
   task: TaskType | null
@@ -44,17 +71,37 @@ export const AnalyzeTaskModal = ({
     }
 
     try {
-      const code = task?.code
+      const response = await fetchApi<TaskDetailType>({
+        url: endpoints.home.libraries.task,
+        method: MethodHTTP.GET,
+        body: { id: task.id },
+      })
+      const code = response?.code
       if (!code) {
         toast.error('No task code found for analysis')
+        setAnalyzing(false)
         return
       }
       const taskCode = typeof code === 'string' ? JSON.parse(code) : code
 
+      let abstractSteps: AbstractStep[] = []
+      if (Array.isArray(taskCode) && taskCode.length > 0) {
+        if (isBlocklyPayload(taskCode)) {
+          const branches = blocklyToAbstractAll(taskCode as CustomBlock[]) || []
+          abstractSteps = branches.find((b) => b.isMain)?.steps || []
+        } else {
+          // Otherwise, assume it is already an AbstractStep[]
+          abstractSteps = taskCode as AbstractStep[]
+        }
+      } else if (taskCode && typeof taskCode.type === 'string') {
+        const branches = blocklyToAbstractAll(taskCode as CustomBlock) || []
+        abstractSteps = branches.find((b) => b.isMain)?.steps || []
+      }
+
       const analyzingTask: AbstractTask = {
         taskName: task.name,
         description: task.description,
-        steps: taskCode,
+        steps: abstractSteps,
       }
 
       // Map objects, locations, actions to analyzer types
@@ -85,115 +132,211 @@ export const AnalyzeTaskModal = ({
           max_load: robot.robot__max_load ?? undefined,
           max_open_tool: robot.robot__max_open_tool ?? undefined,
         }))
-        .find((robot) => robot.id === selectedRobot) as
-        | AbstractRobot
-        | undefined
-      // Optionally, add robot info if available
+        .find((robot) => robot.id === selectedRobot)
+
       const results = analyzeAbstractTask(analyzingTask)
       setTaskAnalyzed(true)
       setAnalyzeResults(results)
       setAnalyzing(false)
     } catch {
       toast.error('Failed to analyze task')
+      setAnalyzing(false)
     }
   }
 
-  return (
-    <Modal
-      title={`Analyze task ${task?.name}`}
-      open={open}
-      onOk={handleOk}
-      okText="Analyze"
-      okButtonProps={{ disabled: !selectedRobot, loading: analyzing }}
-      onCancel={() => {
-        setAnalyzing(false)
-        setTaskAnalyzed(false)
-        handleClose()
-        setSelectedRobot('')
-      }}
-      cancelButtonProps={{ style: { float: 'left' } }}
-      maskClosable={false}
-      closeIcon={null}
-    >
-      <p>Are you sure to analyze this task?</p>
-      <p style={{ marginTop: '2rem', fontWeight: 400 }}>Description:</p>
-      {task?.description ? (
-        <p>
-          <i>{task?.description}</i>
-        </p>
-      ) : (
-        <p>
-          <i>None</i>
-        </p>
-      )}
-      <FormControl fullWidth style={{ marginTop: '2rem' }}>
-        <InputLabel id="robot-id-label">Robot</InputLabel>
-        <Select
-          labelId="robot-id-label"
-          id="robot"
-          value={selectedRobot || ''}
-          label="Robot"
-          name="robot"
-          onChange={(e) => {
-            setSelectedRobot(e.target.value)
-            setTaskAnalyzed(false)
-            setAnalyzeResults([])
-          }}
-          title="Robot use to run the task"
-        >
-          {dataMyRobots?.map((myRobot) => (
-            <MenuItem value={myRobot.id} key={myRobot.id}>
-              {myRobot.name}
-            </MenuItem>
-          ))}
-        </Select>
-      </FormControl>
+  const handleCancelClick = () => {
+    setAnalyzing(false)
+    setTaskAnalyzed(false)
+    handleClose()
+    setSelectedRobot('')
+    setAnalyzeResults([])
+  }
 
-      <div style={{ marginTop: '2rem', marginBottom: '2rem' }}>
-        {taskAnalyzed &&
-          (analyzeResults.length === 0 ? (
-            <Alert icon={<CheckOutlined />} severity="success">
-              No issues found. Task is valid!
-            </Alert>
-          ) : (
-            <>
-              <Alert
-                icon={<CloseOutlined />}
-                severity="error"
-                style={{ marginBottom: '1rem' }}
+  return (
+    <Dialog
+      open={open}
+      onClose={handleCancelClick}
+      slotProps={{
+        paper: { sx: { p: 1.5, maxWidth: '520px', width: '100%' } },
+      }}
+    >
+      <DialogTitle sx={{ pb: 1 }}>Check for problems: {task?.name}</DialogTitle>
+
+      <DialogContent sx={{ py: 1.5 }}>
+        {analyzing && (
+          <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+            <CircularProgress size={36} />
+          </Box>
+        )}
+
+        {!analyzing && (
+          <>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Checks the task's logic for problems before you run it — nothing
+              on the robot moves.
+            </Typography>
+
+            <Box sx={{ mb: 3 }}>
+              <Typography
+                variant="caption"
+                sx={{
+                  fontWeight: 600,
+                  color: 'text.secondary',
+                  textTransform: 'uppercase',
+                  display: 'block',
+                  mb: 0.5,
+                }}
               >
-                Issues found. Please review the task before running it.
-              </Alert>
-              <ul>
-                {analyzeResults.map((issue) => (
-                  <li
-                    key={issue.message}
-                    style={{ color: issue.type === 'error' ? 'red' : 'orange' }}
-                  >
-                    <b>{issue.message}</b>
-                    <br />
-                    (at step{' '}
-                    {issue.stepPath
-                      .map((step) =>
-                        typeof step === 'number' ? step + 1 : step,
-                      )
-                      .join(' > ')}
-                    )
-                  </li>
+                Description
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontStyle: task?.description ? 'normal' : 'italic',
+                  color: 'text.primary',
+                  bgcolor: 'rgba(0, 0, 0, 0.02)',
+                  p: 1.5,
+                  borderRadius: '6px',
+                  border: '1px solid',
+                  borderColor: 'divider',
+                }}
+              >
+                {task?.description || 'None'}
+              </Typography>
+            </Box>
+
+            <FormControl fullWidth sx={{ mb: 3 }}>
+              <InputLabel id="robot-id-label">Robot</InputLabel>
+              <Select
+                labelId="robot-id-label"
+                id="robot"
+                value={selectedRobot || ''}
+                label="Robot"
+                name="robot"
+                onChange={(e) => {
+                  setSelectedRobot(e.target.value)
+                  setTaskAnalyzed(false)
+                  setAnalyzeResults([])
+                }}
+                title="Robot used to run the task"
+              >
+                {dataMyRobots?.map((myRobot) => (
+                  <MenuItem value={myRobot.id} key={myRobot.id}>
+                    {myRobot.name}
+                  </MenuItem>
                 ))}
-              </ul>
-            </>
-          ))}
-      </div>
-      {analyzing && (
-        <Spin
-          size="large"
-          style={{
-            top: '50%',
-            left: '50%',
-          }}
-        />
-      )}
-    </Modal>
+              </Select>
+            </FormControl>
+
+            <Box sx={{ mt: 2, mb: 1 }}>
+              {taskAnalyzed &&
+                (analyzeResults.length === 0 ? (
+                  <Alert
+                    severity="success"
+                    icon={<CheckCircle2 size={18} />}
+                    sx={{ borderRadius: '8px' }}
+                  >
+                    No issues found. Task logic is completely valid!
+                  </Alert>
+                ) : (
+                  <Stack spacing={2}>
+                    <Alert
+                      severity="error"
+                      icon={<AlertCircle size={18} />}
+                      sx={{ borderRadius: '8px' }}
+                    >
+                      Issues detected. Please review prior to execution.
+                    </Alert>
+
+                    <Box
+                      component="ul"
+                      sx={{
+                        pl: 2.5,
+                        m: 0,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 1.5,
+                        maxHeight: '200px',
+                        overflowY: 'auto',
+                        border: '1px solid',
+                        borderColor: 'divider',
+                        borderRadius: '8px',
+                        p: 2,
+                        bgcolor: 'grey.50',
+                      }}
+                    >
+                      {analyzeResults.map((issue, idx) => (
+                        <Box
+                          component="li"
+                          key={idx}
+                          sx={{
+                            // .main fails AA as text on this light bg (error
+                            // 3.61:1, warning 2.06:1) — .dark/.darker clear it.
+                            color:
+                              issue.type === 'error'
+                                ? 'error.dark'
+                                : 'warning.darker',
+                            fontSize: '0.85rem',
+                          }}
+                        >
+                          <Typography
+                            component="span"
+                            variant="subtitle2"
+                            color="inherit"
+                            sx={{ fontWeight: 600 }}
+                          >
+                            {issue.message}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ display: 'block', mt: 0.25 }}
+                          >
+                            At:{' '}
+                            {issue.stepPath
+                              .map((step) =>
+                                typeof step === 'number'
+                                  ? `step ${step + 1}`
+                                  : ({
+                                      steps: 'inside the repeat',
+                                      do: 'then',
+                                      otherwise: 'otherwise',
+                                    }[step] ?? step),
+                              )
+                              .join(' → ')}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </Box>
+                  </Stack>
+                ))}
+            </Box>
+          </>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ px: 3, pb: 2, justifyContent: 'space-between' }}>
+        <Button
+          variant="text"
+          onClick={handleCancelClick}
+          sx={{ fontWeight: 500 }}
+        >
+          Cancel
+        </Button>
+        <Tooltip title={!selectedRobot ? 'Select a robot first' : ''}>
+          <span>
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={handleOk}
+              disabled={!selectedRobot || analyzing}
+              sx={{ fontWeight: 500, borderRadius: '8px', minWidth: '80px' }}
+            >
+              Check for problems
+            </Button>
+          </span>
+        </Tooltip>
+      </DialogActions>
+    </Dialog>
   )
 }

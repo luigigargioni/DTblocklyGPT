@@ -1,101 +1,175 @@
-import { PalettesProps } from '@ant-design/colors'
-import { ThemeConfig } from 'antd'
+// DTblocklyGPT Design System v1.0 — MUI Theme Tokens
+// Primary: Indigo #6366F1 | Font: Geist → Inter → General Sans
+// Light-mode default. Dark mode: border token rgba(99,102,241,0.20).
+//
+// Single source of truth for raw color values. React code reads colors via
+// `theme.palette.*` (derived from here in themes/palette.ts). Non-React Blockly
+// config (.ts files that can't use the useTheme hook) imports the named consts
+// below directly. Block *category* colors live separately in
+// features/blockly/blocks/palette.ts (blocksColours).
 
-export const Theme = (colors: PalettesProps) => {
-  const { blue, red, gold, cyan, green, grey } = colors
-  const greyColors = {
-    0: grey[0],
-    50: grey[1],
-    100: grey[2],
-    200: grey[3],
-    300: grey[4],
-    400: grey[5],
-    500: grey[6],
-    600: grey[7],
-    700: grey[8],
-    800: grey[9],
-    900: grey[10],
-    A50: grey[15],
-    A100: grey[11],
-    A200: grey[12],
-    A400: grey[13],
-    A700: grey[14],
-    A800: grey[16],
-  }
-  const contrastText = '#fff'
+/** Brand indigo, for Blockly config that can't reach the MUI theme. */
+export const brand = {
+  primary: '#6366F1',
+  primaryLighter: '#EEF2FF',
+} as const
+
+/**
+ * Editor state colours, kept apart from `brand` because they encode a rule
+ * rather than an identity:
+ *
+ *   amber  = "you have this selected" (mouse click or keyboard cursor)
+ *   indigo = "the robot is running this right now" (block--executing)
+ *
+ * Selection must never be indigo, or a highlighted block stops telling the
+ * operator whether it is merely picked or actually executing — the one
+ * distinction that matters while a program is running on the real arm.
+ *
+ * The amber matches the stroke Blockly hardcodes for `.blocklySelected >
+ * .blocklyPath`, which no theme option or CSS variable reaches; matching it
+ * here is what keeps the mouse and the arrow keys showing the same colour.
+ */
+export const editorState = {
+  selection: '#FFCC33',
+  executing: '#6366F1',
+} as const
+
+/**
+ * Cool slate ramp — UI chrome (surfaces, borders, muted text) used across
+ * dialogs, toolbox, and previews. Distinct from the neutral `grey` ramp.
+ */
+export const slate = {
+  50: '#F8FAFC',
+  100: '#F1F5F9',
+  200: '#E2E8F0',
+  300: '#CBD5E1',
+  400: '#94A3B8',
+  500: '#64748B',
+  600: '#475569',
+  700: '#334155',
+  800: '#1E293B',
+  900: '#0F172A',
+} as const
+
+/** Terracotta accent — destructive / delete affordances (not the theme red). */
+export const accent = {
+  lighter: '#FFF7ED',
+  light: '#FFEDD5',
+  main: '#E15930',
+  dark: '#C84D28',
+  darker: '#C2410C',
+  contrastText: '#FFFFFF',
+} as const
+
+/** Neutral grays used by the Blockly canvas chrome (grid, scrollbar, bg). */
+export const canvasNeutral = {
+  bg: '#FAFAFB', // matches editor.css .blocklySvg — one canvas color, not two
+  scrollbar: '#D9D9D9',
+  grid: '#DEDEE3', // lighter grid dots, less visual noise on the canvas
+} as const
+
+export const Theme = () => {
+  const greyPrimary = [
+    '#ffffff', // 0
+    '#fafafa', // 50
+    '#f5f5f5', // 100
+    '#f0f0f0', // 200
+    '#d9d9d9', // 300
+    '#bfbfbf', // 400
+    '#8c8c8c', // 500
+    '#595959', // 600
+    '#262626', // 700
+    '#141414', // 800
+    '#000000', // 900
+  ]
+  const greyAscent = ['#fafafa', '#bfbfbf', '#434343', '#1f1f1f']
+  const greyConstant = ['#fafafb', '#e6ebf1']
+
+  const grey = [...greyPrimary, ...greyAscent, ...greyConstant]
 
   return {
     primary: {
-      lighter: blue[0],
-      100: blue[1],
-      200: blue[2],
-      light: blue[3],
-      400: blue[4],
-      main: blue[5],
-      dark: blue[6],
-      700: blue[7],
-      darker: blue[8],
-      900: blue[9],
-      contrastText,
+      lighter: 'hsl(239, 84%, 95%)', // #eef2ff
+      100: 'hsl(239, 84%, 90%)',
+      200: 'hsl(239, 84%, 85%)', // #c7d2fe
+      light: 'hsl(239, 84%, 75%)',
+      400: '#818CF8', // Indigo 400
+      main: '#6366F1', // Indigo 500 — brand accent
+      dark: '#4F46E5', // Indigo 600
+      700: '#4338CA', // Indigo 700
+      darker: '#3730A3', // Indigo 800
+      900: '#312E81', // Indigo 900
+      contrastText: '#FFFFFF',
     },
     secondary: {
-      lighter: greyColors[100],
-      100: greyColors[100],
-      200: greyColors[200],
-      light: greyColors[300],
-      400: greyColors[400],
-      main: greyColors[500],
-      600: greyColors[600],
-      dark: greyColors[700],
-      800: greyColors[800],
-      darker: greyColors[900],
-      A100: greyColors[0],
-      A200: greyColors.A400,
-      A300: greyColors.A700,
-      contrastText: greyColors[0],
+      lighter: grey[1],
+      100: grey[2],
+      200: grey[3],
+      light: grey[4],
+      400: grey[5],
+      main: grey[6],
+      600: grey[7],
+      dark: grey[8],
+      800: grey[9],
+      darker: grey[10],
+      A50: grey[11],
+      A100: grey[0],
+      A200: grey[13],
+      A300: grey[14],
+      contrastText: grey[0],
     },
     error: {
-      lighter: red[0],
-      light: red[2],
-      main: red[4],
-      dark: red[7],
-      darker: red[9],
-      contrastText,
+      lighter: '#fde8e8',
+      light: '#F87171',
+      main: '#EF4444',
+      dark: '#DC2626',
+      darker: '#B91C1C',
+      contrastText: '#FFFFFF',
     },
+    // warning/success/info contrastText is ink, not white: white-on-main fails
+    // WCAG 1.4.3 (2.15 / 2.54 / 2.77:1). Ink on these three mains clears
+    // 6-8:1 (Supabase ink-on-brand pattern). error stays white — error.dark
+    // (not .main) is used wherever error carries text, see overrides/Button.ts.
     warning: {
-      lighter: gold[0],
-      light: gold[3],
-      main: gold[5],
-      dark: gold[7],
-      darker: gold[9],
-      contrastText: greyColors[100],
+      lighter: '#fef3c7',
+      light: '#FCD34D',
+      main: '#F59E0B',
+      dark: '#D97706',
+      darker: '#B45309',
+      contrastText: '#1A1A2E',
     },
     info: {
-      lighter: cyan[0],
-      light: cyan[3],
-      main: cyan[5],
-      dark: cyan[7],
-      darker: cyan[9],
-      contrastText,
+      lighter: '#e0f2fe',
+      light: '#38BDF8',
+      main: '#0EA5E9',
+      dark: '#0284C7',
+      darker: '#0369A1',
+      contrastText: '#1A1A2E',
     },
     success: {
-      lighter: green[0],
-      light: green[3],
-      main: green[5],
-      dark: green[7],
-      darker: green[9],
-      contrastText,
+      lighter: '#d1fae5',
+      light: '#34D399',
+      main: '#10B981',
+      dark: '#059669',
+      darker: '#047857',
+      contrastText: '#1A1A2E',
     },
-    grey: greyColors,
+    // "Draft in progress" task status — previously a bare hex with no theme
+    // token (utils/taskStatus.ts). Cyan, not blue: the old #3B82F6 sat only
+    // ~22° from primary indigo #6366F1 on the hue wheel and read as "the same
+    // clickable blue family" at a glance; also `.main` (what the chip text
+    // actually uses) only hit ~3.7:1 on white, under the 4.5:1 AA text
+    // minimum. main #0E7490 on white = 5.35:1.
+    inProgress: {
+      lighter: '#CFFAFE',
+      light: '#22D3EE',
+      main: '#0E7490',
+      dark: '#155E75',
+      darker: '#164E63',
+      contrastText: '#1A1A2E',
+    },
+    grey,
+    slate,
+    accent,
   }
-}
-
-export const backgroundForm = '#f2fafd'
-
-export const antdTheme: ThemeConfig = {
-  components: {
-    Collapse: {
-      colorBgContainer: backgroundForm,
-    },
-  },
 }

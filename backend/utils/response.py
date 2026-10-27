@@ -51,7 +51,7 @@ def error_response(error, status=500):
     )
 
 
-def bad_request(error, payload, status=400):
+def bad_request(error, payload=None, status=400):
     return JsonResponse(
         {
             "message": error,

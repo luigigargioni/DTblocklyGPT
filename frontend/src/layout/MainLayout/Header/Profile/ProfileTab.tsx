@@ -1,86 +1,80 @@
 import { useState } from 'react'
 import { useTheme } from '@mui/material/styles'
-import { List, ListItemButton, ListItemIcon, ListItemText } from '@mui/material'
-import {
-  /* KeyOutlined, */ LogoutOutlined /* SettingOutlined */,
-} from '@ant-design/icons'
+import { ListItemIcon, ListItemText, MenuItem } from '@mui/material'
+import { Key, LogOut } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-// import { useDispatch } from 'react-redux'
 import { toast } from 'react-toastify'
 
 import {
   LocalStorageKey,
   removeFromLocalStorage,
 } from 'utils/localStorageUtils'
-// import { activeItem } from 'store/reducers/menu'
 import { MessageText } from 'utils/messages'
+import { endpoints } from 'services/endpoints'
+import { MethodHTTP, fetchApi } from 'services/api'
 
-/*
 interface ProfileTabProps {
-  setOpen: (open: boolean) => void
+  setOpen?: (open: boolean) => void
 }
-  */
 
-export const ProfileTab = (/* { setOpen }: ProfileTabProps */) => {
+export const ProfileTab = ({ setOpen }: ProfileTabProps) => {
   const theme = useTheme()
-  // const dispatch = useDispatch()
   const navigate = useNavigate()
 
   const [selectedIndex, setSelectedIndex] = useState(-1)
 
-  /*
-  const handleListItemClick = (index: number, id: string) => {
-    dispatch(activeItem(id))
-    setSelectedIndex(index)
-    navigate(`/${id}`)
-    setOpen(false)
+  const handleChangePassword = () => {
+    setSelectedIndex(0)
+    setOpen?.(false)
+    void navigate('/changepassword')
   }
-    */
 
   const handleLogout = async () => {
     setSelectedIndex(1)
+    // The success toast and the redirect wait for the logout response: firing them
+    // outside the promise gives a green "logged out" over a Django session cookie
+    // that is still valid when the backend is offline or restarting, and Back (or any
+    // app URL) re-authenticates through ProtectedRoute into the account. On a shared
+    // workstation that is the next person landing in the previous one's data.
+    let serverSessionEnded = true
+    try {
+      await fetchApi({ url: endpoints.auth.logout, method: MethodHTTP.POST })
+    } catch (error: unknown) {
+      console.error('Server logout failed:', error)
+      serverSessionEnded = false
+    }
+
+    // Local state and the redirect happen either way: leaving someone stuck on
+    // an authenticated screen because the network is down would be worse, and
+    // is not what they asked for.
     removeFromLocalStorage(LocalStorageKey.USER)
-    toast.success(MessageText.logoutSuccess)
-    navigate('/login')
+    if (serverSessionEnded) {
+      toast.success(MessageText.logoutSuccess)
+    } else {
+      toast.warning(MessageText.logoutServerUnreachable)
+    }
+    setOpen?.(false)
+    void navigate('/login')
   }
 
   return (
-    <List
-      component="nav"
-      sx={{
-        p: 0,
-        '& .MuiListItemIcon-root': {
-          minWidth: 32,
-          color: theme.palette.grey[500],
-        },
-      }}
-    >
-      {/*       <ListItemButton
+    <>
+      <MenuItem selected={selectedIndex === 0} onClick={handleChangePassword}>
+        <ListItemIcon sx={{ minWidth: 32, color: theme.palette.slate[500] }}>
+          <Key size={16} />
+        </ListItemIcon>
+        <ListItemText primary="Change password" />
+      </MenuItem>
+
+      <MenuItem
         selected={selectedIndex === 1}
-        onClick={() => handleListItemClick(1, 'impostazioni')}
+        onClick={() => void handleLogout()}
       >
-        <ListItemIcon>
-          <SettingOutlined />
-        </ListItemIcon>
-        <ListItemText primary="Impostazioni" />
-      </ListItemButton> */}
-
-      {/*       <ListItemButton
-        selected={selectedIndex === 0}
-        onClick={() => handleListItemClick(0, 'cambiopassword')}
-      >
-        <ListItemIcon>
-          <KeyOutlined />
-        </ListItemIcon>
-        <ListItemText primary="Cambio password" />
-      </ListItemButton> */}
-
-      <ListItemButton selected={selectedIndex === 2} onClick={handleLogout}>
-        <ListItemIcon>
-          <LogoutOutlined />
+        <ListItemIcon sx={{ minWidth: 32, color: theme.palette.slate[500] }}>
+          <LogOut size={16} />
         </ListItemIcon>
         <ListItemText primary="Logout" />
-      </ListItemButton>
-    </List>
+      </MenuItem>
+    </>
   )
 }

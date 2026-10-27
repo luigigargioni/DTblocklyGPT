@@ -11,6 +11,8 @@ const HOME_API = `${SERVER_API}/home`
 const GRAPHIC_API = `${SERVER_API}/graphic`
 const CHAT_API = `${SERVER_API}/chat`
 const TASK_API = `${SERVER_API}/task`
+const VISION_API = `${SERVER_API}/vision`
+const HUMAN_API = `${SERVER_API}/human`
 
 export const endpoints = {
   auth: {
@@ -53,15 +55,30 @@ export const endpoints = {
     objectsGraphic: `${GRAPHIC_API}/objectsGraphic/`,
     locationsGraphic: `${GRAPHIC_API}/locationsGraphic/`,
     actionsGraphic: `${GRAPHIC_API}/actionsGraphic/`,
+    macroList: `${GRAPHIC_API}/macroList/`,
   },
   chat: {
-    newMessage: `${CHAT_API}/newMessage/`,
     newMessageMultimodal: `${CHAT_API}/newMessageMultimodal/`,
-    saveChatTask: `${CHAT_API}/saveChatTask/`,
   },
   task: {
-    run: `${TASK_API}/run/`,
     simulate: `${TASK_API}/simulate/`,
-    analyze: `${TASK_API}/analyze/`,
+    stop: `${TASK_API}/simulate/stop/`,
+    runState: `${TASK_API}/simulate/state/`,
+    hardwareStatus: `${TASK_API}/hardware-status/`,
+    saveDraft: `${TASK_API}/save-draft/`,
+    publish: `${TASK_API}/publish/`,
+    discardDraft: `${TASK_API}/discard-draft/`,
+  },
+  vision: {
+    frame: `${VISION_API}/frame/`,
+    voice: `${VISION_API}/voice/`,
+  },
+  human: {
+    confirm: `${HUMAN_API}/confirm/`,
+  },
+  // Alias kept for formTask.tsx — same endpoints as `task` above.
+  // (macroApi.ts, the other caller, was removed: it never had a call site.)
+  get macro() {
+    return this.task
   },
 }

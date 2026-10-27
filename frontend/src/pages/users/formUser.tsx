@@ -1,3 +1,17 @@
+/**
+ * user accounts (manager-only)
+ *
+ * One of six sibling CRUD forms (pages/{objects,actions,locations,robots,users,myrobots}/form*.tsx)
+ * that all share the same shape: Formik state + a yup schema, submitted through
+ * `fetchApi` from services/api.ts.
+ *
+ * The one part that is not boilerplate is the duplicate-name branch. `fetchApi`
+ * RESOLVES on 400/409 instead of rejecting (see the LANDMINE comment in
+ * services/api.ts), so a name collision arrives as a normal `.then()` carrying
+ * a flag in the payload — never as a `.catch()`. These forms therefore inspect
+ * the response body and push the error onto the field with `setFieldError`.
+ * Reading the collision from a rejected promise would silently never fire.
+ */
 import React from 'react'
 import {
   Button,
@@ -21,6 +35,7 @@ import {
 import { fetchApi, MethodHTTP } from 'services/api'
 import { endpoints } from 'services/endpoints'
 import { MessageText, MessageTextMaxLength } from 'utils/messages'
+
 import { RoleType, UserDetailType } from './types'
 
 interface FormUserProps {
@@ -28,6 +43,10 @@ interface FormUserProps {
   dataRoles: RoleType[]
   insertMode: boolean
   backFunction: () => void
+}
+
+interface SaveUserResponse {
+  usernameAlreadyExists?: boolean
 }
 
 export const FormUser = ({
@@ -41,9 +60,13 @@ export const FormUser = ({
     { setStatus, setSubmitting, setFieldTouched, setFieldError },
   ) => {
     const method = insertMode ? MethodHTTP.POST : MethodHTTP.PUT
-    fetchApi({ url: endpoints.home.management.user, method, body: values })
+    void fetchApi<SaveUserResponse, UserDetailType>({
+      url: endpoints.home.management.user,
+      method,
+      body: values,
+    })
       .then(async (res) => {
-        if (res && res.usernameAlreadyExists) {
+        if (res?.usernameAlreadyExists) {
           await setFieldTouched('username', true)
           await setFieldError('username', MessageText.alreadyExists)
           setStatus({ success: false })
@@ -52,6 +75,9 @@ export const FormUser = ({
         setStatus({ success: true })
         toast.success(MessageText.success)
         backFunction()
+      })
+      .catch(() => {
+        setStatus({ success: false })
       })
       .finally(() => {
         setSubmitting(false)
@@ -90,13 +116,7 @@ export const FormUser = ({
         touched,
         values,
       }) => (
-        <form
-          noValidate
-          onSubmit={handleSubmit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.preventDefault()
-          }}
-        >
+        <form noValidate onSubmit={handleSubmit}>
           <Grid container spacing={3} columns={{ xs: 1, sm: 6, md: 12 }}>
             <Grid size={2}>
               <Stack spacing={1}>
@@ -105,13 +125,20 @@ export const FormUser = ({
                   value={values.username || ''}
                   name="username"
                   label="Username"
+                  required
                   onBlur={handleBlur}
                   onChange={handleChange}
                   error={Boolean(touched.username && errors.username)}
-                  title="Username of the user"
+                  aria-invalid={Boolean(touched.username && errors.username)}
+                  aria-describedby={
+                    touched.username && errors.username
+                      ? 'helper-text-username'
+                      : undefined
+                  }
+                  title="Username of the user account"
                 />
                 {touched.username && errors.username && (
-                  <FormHelperText error id="helper-text-username">
+                  <FormHelperText error role="alert" id="helper-text-username">
                     {errors.username}
                   </FormHelperText>
                 )}
@@ -127,10 +154,16 @@ export const FormUser = ({
                   onBlur={handleBlur}
                   onChange={handleChange}
                   error={Boolean(touched.email && errors.email)}
-                  title="Email of the user"
+                  aria-invalid={Boolean(touched.email && errors.email)}
+                  aria-describedby={
+                    touched.email && errors.email
+                      ? 'helper-text-email'
+                      : undefined
+                  }
+                  title="Email of the user account"
                 />
                 {touched.email && errors.email && (
-                  <FormHelperText error id="helper-text-email">
+                  <FormHelperText error role="alert" id="helper-text-email">
                     {errors.email}
                   </FormHelperText>
                 )}
@@ -145,7 +178,7 @@ export const FormUser = ({
                   label="First name"
                   onBlur={handleBlur}
                   onChange={handleChange}
-                  title="First name of the user"
+                  title="First name of the user account"
                 />
               </Stack>
             </Grid>
@@ -158,24 +191,33 @@ export const FormUser = ({
                   label="Last name"
                   onBlur={handleBlur}
                   onChange={handleChange}
-                  title="Last name of the user"
+                  title="Last name of the user account"
                 />
               </Stack>
             </Grid>
             <Grid size={4}>
               <Stack spacing={1}>
                 <FormControl fullWidth>
-                  <InputLabel id="role-label">Role</InputLabel>
+                  <InputLabel id="role-label" required>
+                    Role
+                  </InputLabel>
                   <Select
                     labelId="role-label"
                     id="role"
                     value={values.role || ''}
                     label="Role"
                     name="role"
+                    required
                     onBlur={handleBlur}
                     onChange={handleChange}
                     error={Boolean(touched.role && errors.role)}
-                    title="Select the role of the user. Manager can also create and edit users and robots at system level"
+                    aria-invalid={Boolean(touched.role && errors.role)}
+                    aria-describedby={
+                      touched.role && errors.role
+                        ? 'helper-text-role'
+                        : undefined
+                    }
+                    title="Select the role of the user account. Managers can also create and edit user accounts and robots in the fleet"
                   >
                     {dataRoles?.map((role) => (
                       <MenuItem value={role.id} key={role.id}>
@@ -184,7 +226,7 @@ export const FormUser = ({
                     ))}
                   </Select>
                   {touched.role && errors.role && (
-                    <FormHelperText error id="helper-text-role">
+                    <FormHelperText error role="alert" id="helper-text-role">
                       {errors.role}
                     </FormHelperText>
                   )}
@@ -200,7 +242,7 @@ export const FormUser = ({
                 type="submit"
                 variant="contained"
                 color="primary"
-                title="Save this user"
+                title="Save user account"
               >
                 Save
               </Button>

@@ -1,4 +1,10 @@
+import logging
 import json
+import copy
+import re
+import time
+from collections import Counter
+from typing import List, Dict, Any, Tuple
 from django.http import HttpResponse, HttpRequest
 from backend.utils.response import (
     HttpMethod,
@@ -7,1218 +13,234 @@ from backend.utils.response import (
     success_response,
     unauthorized_request,
 )
-from json import loads, dumps
+from json import loads
 from openai import OpenAI
 from dataclasses import dataclass
-from typing import List, Union, Optional, Literal
 
-from backend.models import Task, Object, Action, Location
-from backend.utils.date import getDateTimeNow
+from backend.models import Object, Action, Location
+from backend.functions import study_log
 from django.db.models import Q
 from django.contrib.auth.models import User
-from enum import Enum
-from typing import Tuple
-from backend.functions.task import EventsItems, LibrariesItems, LogicItems, StepsItems
 import os
 
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("The OPENAI_API_KEY environment variable is not set.")
-client = OpenAI(api_key=api_key)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+# Per-provider keys: keep all set at once and switch providers with LLM_PROVIDER.
+# LLM_API_KEY (if set) is an optional override that wins for any provider.
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+CHATGPT_TEMPERATURE = 0.0
+# Cap the round-tripped user/assistant history — the task snapshot is already
+# re-sent in full every turn via the system prompt, so old turns are only
+# needed for conversational continuity, not task state.
+MAX_CHAT_HISTORY = 20
 
-CHATGPT_MODEL = "gpt-4.1-mini"
-CHATGPT_TEMPERATURE = 0
+logger = logging.getLogger(__name__)
 
-CHATGPT_INSTRUCTIONS = """
-You are an assistant designed to extract intent from text. You must drive the user to define a Pick-and-Place task for a collaborative robot providing to him/her the details to be defined before he/she asks for them.
-Do not include any explanations, just provide an RFC8259 compliant JSON response that follows this format without deviation:
-{
-    answer: string,
-    task: {
-        program: {
-            control: {
-                control_type: string | null,
-                times: number | null,
-                event: {
-                    event_type: string | null,
-                    find_object: string | null,
-                },
-                otherwise: {
-                    otherwise_pick: {
-                        object: string | null
-                    },
-                    otherwise_processing: {
-                    action: string | null
-                    },
-                    otherwise_place: {
-                        location: string | null
-                    },
-                },
-                control_pick: {
-                    object: string | null
-                },
-                control_processing: {
-                    action: string | null
-                },
-                control_place: {
-                    location: string | null
+
+# Process-global cache, not per-request — fine for a single dev server; a
+# multi-worker deployment would need a shared cache (e.g. Redis).
+_SCENE_CACHE = {"value": None, "at": 0.0}
+_SCENE_CACHE_TTL_OK = 3       # seconds — scene changes slowly, avoid re-fetch on rapid chat turns
+_SCENE_CACHE_TTL_DOWN = 30    # seconds — don't re-pay the bridge timeout on every message while it's down
+
+
+def _scene_summary():
+    """Live workspace state for the LLM prompt, aggregated by class+colour.
+
+    Returns e.g. [{"type": "bottle", "color": "blue", "count": 2}] — no
+    bboxes, the model only needs what is visible. "unavailable" when the
+    vision bridge is down (sim without camera, bridge off): the prompt
+    tolerates it. Cached briefly so a burst of chat messages (or a message
+    unrelated to vision) doesn't re-hit the bridge, and re-probe less often
+    while it's down instead of eating its timeout on every turn.
+    """
+    now = time.monotonic()
+    cached = _SCENE_CACHE["value"]
+    ttl = _SCENE_CACHE_TTL_DOWN if cached == "unavailable" else _SCENE_CACHE_TTL_OK
+    if cached is not None and (now - _SCENE_CACHE["at"]) < ttl:
+        return cached
+
+    from backend.functions.flask_ros_client import FlaskRosClient
+
+    try:
+        state = FlaskRosClient().get_vision_state()
+        counts = Counter(
+            (d.get("class"), d.get("color"))
+            for d in state.get("detections", [])
+            if d.get("class")
+        )
+        result = [
+            {"type": cls, **({"color": color} if color else {}), "count": n}
+            for (cls, color), n in sorted(counts.items(), key=str)
+        ]
+    except Exception:
+        result = "unavailable"
+
+    _SCENE_CACHE["value"] = result
+    _SCENE_CACHE["at"] = now
+    return result
+
+
+@dataclass
+class ProviderLLMResponse:
+    answer: str                    # Extracted natural-language text
+    raw_arguments: dict            # Parsed tool-call arguments
+    raw_response: object           # Original client response, for debugging
+
+
+class LLMProvider:
+    """Single OpenAI-compatible provider. base_url selects Gemini vs OpenAI (see get_llm_provider)."""
+
+    def __init__(self, api_key: str, base_url: str = None, model: str = "gemini-2.5-flash", timeout: int = 30, max_retries: int = 3):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=self.max_retries
+        )
+
+    def complete(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], tool_name: str, temperature: float = 0.0) -> ProviderLLMResponse:
+        started_at = time.monotonic()
+        request_kwargs = dict(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            tool_choice={
+                "type": "function",
+                "function": {
+                    "name": tool_name,
                 },
             },
-            pick: {
-                object: string | null
-            },
-            processing: {
-                action: string | null
-            },
-            place: {
-                location: string | null
-            }
-        }
-    },
-    finished: boolean
-}
-IMPORTANT: the 'answer' field is mandatory and must be filled with a string.
+            parallel_tool_calls=False,
+        )
+        # gpt-5.x rejects any non-default temperature (400 "does not support
+        # 0.0 with this model") — only the implicit default is accepted, so
+        # omit the param entirely rather than pass a value that always 400s.
+        if not self.model.startswith("gpt-5"):
+            request_kwargs["temperature"] = temperature
+        # The luna models additionally reject function tools outright unless
+        # reasoning_effort is explicitly "none" (400 "Function tools with
+        # reasoning_effort are not supported for gpt-5.6-luna in
+        # /v1/chat/completions... or set reasoning_effort to 'none'"). gpt-6-luna
+        # answers identically, and accepts temperature=0 alongside it.
+        # Scoped to these two models; other gpt-5.x models are unaffected.
+        if self.model in ("gpt-5.6-luna", "gpt-6-luna"):
+            request_kwargs["reasoning_effort"] = "none"
+        response = self.client.chat.completions.create(**request_kwargs)
+        latency_ms = (time.monotonic() - started_at) * 1000
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "LLM call model=%s latency_ms=%.0f prompt_tokens=%s completion_tokens=%s",
+            self.model, latency_ms,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+        )
+        msg = response.choices[0].message
+        if msg.tool_calls and len(msg.tool_calls) > 0:
+            arguments_str = msg.tool_calls[0].function.arguments
+        else:
+            arguments_str = msg.content or "{}"
 
-Explaination of the context:
-- The user is not a roboticist or IT expert and he/she needs to create a task for a cobot to help him/her define pick and place tasks.
-- To define a task, the user has to specify the pick object and the place location. The user can also specify an action to be performed on the object.
-- The user can also specify a control intent to define a condition to be satisfied before the pick and place task can be executed.
+        try:
+            raw_arguments = json.loads(arguments_str)
+        except Exception:
+            try:
+                # Some models (observed: qwen2.5:14b via Ollama) answer with
+                # prose plus a ```json ... ``` fenced block instead of a bare
+                # JSON object or a real tool call — extract the fenced
+                # payload before giving up on the whole proposal.
+                fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", arguments_str, re.DOTALL)
+                if not fenced:
+                    raise ValueError("no fenced block found")
+                raw_arguments = json.loads(fenced.group(1))
+            except Exception:
+                try:
+                    # Some models (observed: the Qwen2.5 family via Ollama —
+                    # 7b and 14b measured, deepseek-r1:14b inherits it from
+                    # sharing the same base weights, qwen2.5:3b does not)
+                    # double every curly brace in the JSON body
+                    # ({{"type": "pick"}} instead of {"type": "pick"}),
+                    raw_arguments = json.loads(arguments_str.replace("{{", "{").replace("}}", "}"))
+                except Exception:
+                    try:
+                        # Some models (observed: qwen2.5:14b, deepseek-r1:14b
+                        # via Ollama) wrap the payload in free-form prose
+                        # instead of either a bare object or a fenced block —
+                        # neither tier above can locate it: the fence regex
+                        # needs literal ``` markers, and the brace-unwrap
+                        # above still runs against the untouched prose, which
+                        # is never valid JSON regardless of the braces inside
+                        # it. Take the span from the first "{" to the last "}"
+                        # in the raw text — works with or without a fence,
+                        # with or without prose before or after it — and
+                        # retry both a plain parse and the same brace-unwrap
+                        # salvage on just that span.
+                        start = arguments_str.index("{")
+                        end = arguments_str.rindex("}") + 1
+                        span = arguments_str[start:end]
+                        try:
+                            raw_arguments = json.loads(span)
+                        except Exception:
+                            raw_arguments = json.loads(span.replace("{{", "{").replace("}}", "}"))
+                    except Exception:
+                        raw_arguments = {}
 
-Resume specifications:
-- When you have collected all the information, you need to present a resume of the task you have just created to the user.
-- You must ask to the user to confirm the summary or ask for changes.
-- If the user wants to make changes, you must ask the modifications required and propose the updated resume asking again to check it.
+        answer = raw_arguments.get("answer", "")
+        return ProviderLLMResponse(
+            answer=answer,
+            raw_arguments=raw_arguments,
+            raw_response=response
+        )
 
-Conclusion specifications:
-- Only after the user has approved the resume, you must set to true the 'finished' property in the JSON.
 
-General instructions:
-- You can't left empty the 'answer' field.
-- The 'answer' field in the JSON is your natural language response to the user. If you're unsure of an answer, you can ask the user to repeat the request.
-"""
+def get_llm_provider() -> LLMProvider:
+    # Resolve the endpoint AND the key per provider, so all keys can stay set at
+    # once and you switch providers just by changing LLM_PROVIDER (for A/B tests).
+    if LLM_PROVIDER == "gemini":
+        api_key = LLM_API_KEY or GEMINI_API_KEY
+        base_url = LLM_BASE_URL or "https://generativelanguage.googleapis.com/v1beta/openai/"
+    elif LLM_PROVIDER == "openai":
+        api_key = LLM_API_KEY or OPENAI_API_KEY
+        base_url = LLM_BASE_URL  # None → official OpenAI endpoint
+    elif LLM_PROVIDER == "ollama":
+        # Ollama exposes an OpenAI-compatible API and needs no real key.
+        api_key = LLM_API_KEY or "ollama"
+        base_url = LLM_BASE_URL or OLLAMA_BASE_URL
+    else:
+        raise ValueError(
+            f"Provider LLM '{LLM_PROVIDER}' not supported (use gemini, openai or ollama)."
+        )
 
-CHATGPT_USE_FUNCTIONS = "Only use the tool you have been provided with."
+    if not api_key:
+        raise ValueError(
+            f"No API key for provider '{LLM_PROVIDER}'. Set the matching env var "
+            "(GEMINI_API_KEY / OPENAI_API_KEY) or LLM_API_KEY."
+        )
+
+    return LLMProvider(
+        api_key=api_key,
+        base_url=base_url,
+        model=LLM_MODEL,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+
+
 CHATGPT_ALWAYS_REPLY = "Always reply to the user. You can't left the property 'answer' blank. If you're unsure of an answer, you can ask the user to repeat the request."
 
-CHATGPT_FUNCTION = {
-    "type": "function",
-    "function": {
-        "name": "parse_chatgpt_response",
-        "description": "Process response from chatgpt to digest information",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": "Model response to the user",
-                },
-                "task": {
-                    "type": "object",
-                    "properties": {
-                        "program": {
-                            "type": "object",
-                            "properties": {
-                                "control": {
-                                    "type": "object",
-                                    "properties": {
-                                        "control_type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "repeat",
-                                                "loop",
-                                                "when",
-                                                "when_otherwise",
-                                                # "stop_when",
-                                                # "do_when",
-                                            ],
-                                            "description": "The control type of the control intent.",
-                                        },
-                                        "times": {
-                                            "type": "integer",
-                                            "description": "The times of repetition in the case of repeat control type.",
-                                        },
-                                        "otherwise": {
-                                            "type": "object",
-                                            "properties": {
-                                                "otherwise_pick": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "object": {
-                                                            "type": "string",
-                                                            "description": "The object of the pick intent.",
-                                                        }
-                                                    },
-                                                    "required": ["object"],
-                                                },
-                                                "otherwise_processing": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "action": {
-                                                            "type": "string",
-                                                            "description": "The action of the action intent.",
-                                                        }
-                                                    },
-                                                    "required": ["action"],
-                                                },
-                                                "otherwise_place": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "location": {
-                                                            "type": "string",
-                                                            "description": "The location of the place intent.",
-                                                        }
-                                                    },
-                                                    "required": ["location"],
-                                                },
-                                            },
-                                            "required": ["pick", "place"],
-                                        },
-                                        "event": {
-                                            "type": "object",
-                                            "properties": {
-                                                "event_type": {
-                                                    "type": "string",
-                                                    "enum": ["sensor", "find", "human"],
-                                                    # "enum": ["detect", "sensor", "find", "human"],
-                                                    "description": "The event type of the event intent.",
-                                                },
-                                                "find_object": {
-                                                    "type": "string",
-                                                    "description": "Object to find in the case of find event type.",
-                                                },
-                                            },
-                                            "required": ["event_type"],
-                                        },
-                                        "control_pick": {
-                                            "type": "object",
-                                            "properties": {
-                                                "object": {
-                                                    "type": "string",
-                                                    "description": "The object of the pick intent.",
-                                                }
-                                            },
-                                            "required": ["object"],
-                                        },
-                                        "control_processing": {
-                                            "type": "object",
-                                            "properties": {
-                                                "action": {
-                                                    "type": "string",
-                                                    "description": "The action of the action intent.",
-                                                }
-                                            },
-                                            "required": ["action"],
-                                        },
-                                        "control_place": {
-                                            "type": "object",
-                                            "properties": {
-                                                "location": {
-                                                    "type": "string",
-                                                    "description": "The location of the place intent.",
-                                                }
-                                            },
-                                            "required": ["location"],
-                                        },
-                                    },
-                                    "required": ["control_type"],
-                                },
-                                "pick": {
-                                    "type": "object",
-                                    "properties": {
-                                        "object": {
-                                            "type": "string",
-                                            "description": "The object of the pick intent.",
-                                        }
-                                    },
-                                    "required": ["object"],
-                                },
-                                "processing": {
-                                    "type": "object",
-                                    "properties": {
-                                        "action": {
-                                            "type": "string",
-                                            "description": "The action of the action intent.",
-                                        }
-                                    },
-                                    "required": ["action"],
-                                },
-                                "place": {
-                                    "type": "object",
-                                    "properties": {
-                                        "location": {
-                                            "type": "string",
-                                            "description": "The location of the place intent.",
-                                        }
-                                    },
-                                    "required": ["location"],
-                                },
-                            },
-                            "required": ["control", "pick", "processing", "place"],
-                        }
-                    },
-                    "required": ["program"],
-                },
-                "finished": {
-                    "type": "boolean",
-                    "description": "The finished intent after the user has approved the resume",
-                },
-            },
-            "required": ["answer", "task", "finished"],
-        },
-    },
-}
 
 CHATGPT_ERROR = "A problem occurred while creating the new message. Please try again."
-
-
-def new_message(request: HttpRequest) -> HttpResponse:
-    try:
-        if request.user.is_authenticated:
-            if request.method == HttpMethod.POST.value:
-                data = loads(request.body)
-                message = data.get("message")
-                chat_log = data.get("chatLog")
-                fine_tuned_model = data.get("fineTunedModel")
-                fine_tuning_job_id = data.get("fineTuningJobId")
-
-                data_result = {}
-
-                # Init the conversation
-                if chat_log is None or len(chat_log) == 0:
-                    """
-                    # Check fine-tuned model
-                    try:
-                        job = openai.FineTuningJob.retrieve(fine_tuning_job_id)
-                        fine_tuned_model = job["fine_tuned_model"]
-                    except Exception:
-                        job = None
-
-                    if job is None:
-                        file_path = path.join(
-                            path.dirname(path.dirname(path.abspath(__file__))),
-                            "functions",
-                            "fine_tuning_tasks.jsonl",
-                        )
-                        file = openai.File.create(
-                            file=open(file_path, "rb"),
-                            purpose="fine-tune",
-                        )
-
-                        job = openai.FineTuningJob.create(
-                            training_file=file["id"],
-                            model="gpt-3.5-turbo",
-                            suffix="DTblocklyGPT-tasks",
-                        )
-
-                        fine_tuning_job_id = job["id"]
-                        fine_tuned_model = job["fine_tuned_model"]
-                        print("NEW MODEL CREATED")
-                        print("Model ID: " + fine_tuned_model)
-                        print("Job ID: " + fine_tuning_job_id)
-                    """
-                    chat_log = [
-                        {
-                            "role": "system",
-                            "content": CHATGPT_INSTRUCTIONS,
-                        },
-                        {"role": "system", "content": CHATGPT_USE_FUNCTIONS},
-                        {"role": "system", "content": CHATGPT_ALWAYS_REPLY},
-                    ]
-
-                chat_log.append({"role": "user", "content": message})
-                response = client.chat.completions.create(
-                    model=CHATGPT_MODEL,
-                    messages=chat_log,
-                    temperature=CHATGPT_TEMPERATURE,
-                    tools=[CHATGPT_FUNCTION],
-                    tool_choice={
-                        "type": "function",
-                        "function": {
-                            "name": CHATGPT_FUNCTION["function"]["name"],
-                        },
-                    },
-                )
-
-                response_json = (
-                    response.choices[0].message.tool_calls[0].function.arguments
-                )
-
-                try:
-                    response_json = loads(response_json)
-                    answer = response_json["answer"]
-
-                    if answer != "":
-                        chat_log.append({"role": "assistant", "content": answer})
-
-                    # Response has the "answer" field blank
-                    i = 0
-                    while not answer:
-                        if (
-                            i > 2
-                        ):  # I can't use ChatGPT API more than 3 times in a minute
-                            # print("FORCE EXIT LOOP NO answer")
-                            forced_answer = "Ok! Let's go ahead."
-                            chat_log.append(
-                                {"role": "assistant", "content": forced_answer}
-                            )
-                            break
-
-                        # print("LOOP NO answer")
-                        # print(response_json)
-                        chat_log.append(
-                            {"role": "system", "content": CHATGPT_ALWAYS_REPLY}
-                        )
-                        response = client.chat.completions.create(
-                            model=CHATGPT_MODEL,
-                            messages=chat_log,
-                            temperature=CHATGPT_TEMPERATURE,
-                            functions=[CHATGPT_FUNCTION],
-                            function_call={"name": CHATGPT_FUNCTION["name"]},
-                        )
-
-                        response_json = response.choices[
-                            0
-                        ].message.function_call.arguments
-
-                        response_json = loads(response_json)
-                        answer = response_json["answer"]
-                        i += 1
-
-                except Exception:
-                    data_result["answer"] = CHATGPT_ERROR
-
-                data_result["chatLog"] = chat_log
-                data_result["response"] = response_json
-                data_result["fineTunedModel"] = fine_tuned_model
-                data_result["fineTuningJobId"] = fine_tuning_job_id
-                return success_response(data_result)
-            else:
-                return invalid_request_method()
-        else:
-            return unauthorized_request()
-    except Exception as e:
-        print(e)
-        return error_response(CHATGPT_ERROR)
-
-
-class ChatLogicItems(Enum):
-    REPEAT = "repeat"
-    LOOP = "loop"
-    WHEN_OTHERWISE = "when_otherwise"
-    WHEN = "when"
-    # STOP_WHEN = "stop_when"
-    # DO_WHEN = "do_when"
-
-
-class ChatEventItems(Enum):
-    SENSOR = "sensor"
-    FIND = "find"
-    HUMAN = "human"
-    # DETECT = "detect"
-
-
-def save_chat_task(request: HttpRequest) -> HttpResponse:
-    try:
-        if request.user.is_authenticated:
-            if request.method == HttpMethod.POST.value:
-                user = User.objects.get(id=request.user.id)
-                data = loads(request.body)
-                task_id = data.get("id")
-                taskStructure = data.get("taskStructure")
-
-                taskCode = {}
-
-                # Repeat and Loop
-                if (
-                    taskStructure["program"]["control"]["control_type"]
-                    == ChatLogicItems.REPEAT.value
-                    or taskStructure["program"]["control"]["control_type"]
-                    == ChatLogicItems.LOOP.value
-                ):
-                    if (
-                        taskStructure["program"]["control"]["control_type"]
-                        == ChatLogicItems.REPEAT.value
-                    ):
-                        taskCode = {
-                            "type": LogicItems.REPEAT.value,
-                            "fields": {
-                                "times": taskStructure["program"]["control"]["times"]
-                            },
-                        }
-                    else:
-                        taskCode = {
-                            "type": LogicItems.LOOP.value,
-                        }
-
-                    object_name_to_search = None
-                    if (
-                        taskStructure["program"]["control"]["control_pick"]["object"]
-                        is not None
-                    ):
-                        object_name_to_search = taskStructure["program"]["control"][
-                            "control_pick"
-                        ]["object"]
-                    else:
-                        object_name_to_search = taskStructure["program"]["pick"][
-                            "object"
-                        ]
-
-                    object_id, object_name, object_keywords = search_existing_libraries(
-                        user,
-                        Object,
-                        object_name_to_search,
-                    )
-
-                    location_name_to_search = None
-                    if (
-                        taskStructure["program"]["control"]["control_place"]["location"]
-                        is not None
-                    ):
-                        location_name_to_search = taskStructure["program"]["control"][
-                            "control_place"
-                        ]["location"]
-                    else:
-                        location_name_to_search = taskStructure["program"]["place"][
-                            "location"
-                        ]
-                    (
-                        location_id,
-                        location_name,
-                        location_keywords,
-                    ) = search_existing_libraries(
-                        user, Location, location_name_to_search
-                    )
-
-                    if (
-                        taskStructure["program"]["control"]["control_processing"][
-                            "action"
-                        ]
-                        is not None
-                        or taskStructure["program"]["processing"]["action"] is not None
-                    ):
-                        action_name_to_search = None
-                        if (
-                            taskStructure["program"]["control"]["control_processing"][
-                                "action"
-                            ]
-                            is not None
-                        ):
-                            action_name_to_search = taskStructure["program"]["control"][
-                                "control_processing"
-                            ]["action"]
-                        else:
-                            action_name_to_search = taskStructure["program"][
-                                "processing"
-                            ]["action"]
-                        (
-                            action_id,
-                            action_name,
-                            action_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Action,
-                            action_name_to_search,
-                        )
-                        taskCode["inputs"] = {
-                            "DO": {
-                                "block": {
-                                    "type": StepsItems.PICK.value,
-                                    "inputs": {
-                                        "OBJECT": {
-                                            "block": {
-                                                "type": LibrariesItems.OBJECT.value,
-                                                "data": dumps(
-                                                    {
-                                                        "id": object_id,
-                                                        "name": object_name,
-                                                        "keywords": object_keywords,
-                                                    }
-                                                ),
-                                                "fields": {"name": object_name},
-                                            }
-                                        }
-                                    },
-                                    "next": {
-                                        "block": {
-                                            "type": StepsItems.PROCESSING.value,
-                                            "inputs": {
-                                                "ACTION": {
-                                                    "block": {
-                                                        "type": LibrariesItems.ACTION.value,
-                                                        "data": dumps(
-                                                            {
-                                                                "id": action_id,
-                                                                "name": action_name,
-                                                                "keywords": action_keywords,
-                                                            }
-                                                        ),
-                                                        "fields": {"name": action_name},
-                                                    }
-                                                }
-                                            },
-                                            "next": {
-                                                "block": {
-                                                    "type": StepsItems.PLACE.value,
-                                                    "inputs": {
-                                                        "LOCATION": {
-                                                            "block": {
-                                                                "type": LibrariesItems.LOCATION.value,
-                                                                "data": dumps(
-                                                                    {
-                                                                        "id": location_id,
-                                                                        "name": location_name,
-                                                                        "keywords": location_keywords,
-                                                                    }
-                                                                ),
-                                                                "fields": {
-                                                                    "name": location_name
-                                                                },
-                                                            }
-                                                        }
-                                                    },
-                                                }
-                                            },
-                                        }
-                                    },
-                                }
-                            }
-                        }
-                    else:
-                        taskCode["inputs"] = {
-                            "DO": {
-                                "block": {
-                                    "type": StepsItems.PICK.value,
-                                    "inputs": {
-                                        "OBJECT": {
-                                            "block": {
-                                                "type": LibrariesItems.OBJECT.value,
-                                                "data": dumps(
-                                                    {
-                                                        "id": object_id,
-                                                        "name": object_name,
-                                                        "keywords": object_keywords,
-                                                    }
-                                                ),
-                                                "fields": {"name": object_name},
-                                            }
-                                        }
-                                    },
-                                    "next": {
-                                        "block": {
-                                            "type": StepsItems.PLACE.value,
-                                            "inputs": {
-                                                "LOCATION": {
-                                                    "block": {
-                                                        "type": LibrariesItems.LOCATION.value,
-                                                        "data": dumps(
-                                                            {
-                                                                "id": location_id,
-                                                                "name": location_name,
-                                                                "keywords": location_keywords,
-                                                            }
-                                                        ),
-                                                        "fields": {
-                                                            "name": location_name
-                                                        },
-                                                    }
-                                                }
-                                            },
-                                        }
-                                    },
-                                }
-                            }
-                        }
-
-                # When and When-Otherwise
-                elif (
-                    taskStructure["program"]["control"]["control_type"]
-                    == ChatLogicItems.WHEN.value
-                    or taskStructure["program"]["control"]["control_type"]
-                    == ChatLogicItems.WHEN_OTHERWISE.value
-                ):
-                    # Control type
-                    if (
-                        taskStructure["program"]["control"]["control_type"]
-                        == ChatLogicItems.WHEN.value
-                    ):
-                        taskCode = {
-                            "type": LogicItems.WHEN.value,
-                        }
-                    else:
-                        taskCode = {
-                            "type": LogicItems.WHEN_OTHERWISE.value,
-                        }
-
-                    # Event type
-                    # if (
-                    #     taskStructure["program"]["control"]["event"]["event_type"]
-                    #     == ChatEventItems.DETECT.value
-                    # ):
-                    #     taskCode["inputs"] = {
-                    #         "WHEN": {
-                    #             "block": {
-                    #                 "type": EventsItems.DETECT.value,
-                    #             }
-                    #         }
-                    #     }
-
-                    if (
-                        taskStructure["program"]["control"]["event"]["event_type"]
-                        == ChatEventItems.SENSOR.value
-                    ):
-                        taskCode["inputs"] = {
-                            "WHEN": {
-                                "block": {
-                                    "type": EventsItems.SENSOR.value,
-                                }
-                            }
-                        }
-                    elif (
-                        taskStructure["program"]["control"]["event"]["event_type"]
-                        == ChatEventItems.HUMAN.value
-                    ):
-                        taskCode["inputs"] = {
-                            "WHEN": {
-                                "block": {
-                                    "type": EventsItems.HUMAN.value,
-                                }
-                            }
-                        }
-                    elif (
-                        taskStructure["program"]["control"]["event"]["event_type"]
-                        == ChatEventItems.FIND.value
-                    ):
-                        (
-                            object_to_find_id,
-                            object_to_find_name,
-                            object_to_find_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Object,
-                            taskStructure["program"]["control"]["event"]["find_object"],
-                        )
-
-                        taskCode["inputs"] = {
-                            "WHEN": {
-                                "block": {
-                                    "type": EventsItems.FIND.value,
-                                    "inputs": {
-                                        "OBJECT": {
-                                            "block": {
-                                                "type": LibrariesItems.OBJECT.value,
-                                            },
-                                            "data": dumps(
-                                                {
-                                                    "id": object_to_find_id,
-                                                    "name": object_to_find_name,
-                                                    "keywords": object_to_find_keywords,
-                                                }
-                                            ),
-                                            "fields": {"name": object_to_find_name},
-                                        }
-                                    },
-                                }
-                            }
-                        }
-
-                    object_name_to_search = None
-                    if (
-                        taskStructure["program"]["control"]["control_pick"]["object"]
-                        is not None
-                    ):
-                        object_name_to_search = taskStructure["program"]["control"][
-                            "control_pick"
-                        ]["object"]
-                    else:
-                        object_name_to_search = taskStructure["program"]["pick"][
-                            "object"
-                        ]
-
-                    object_id, object_name, object_keywords = search_existing_libraries(
-                        user,
-                        Object,
-                        object_name_to_search,
-                    )
-
-                    location_name_to_search = None
-                    if (
-                        taskStructure["program"]["control"]["control_place"]["location"]
-                        is not None
-                    ):
-                        location_name_to_search = taskStructure["program"]["control"][
-                            "control_place"
-                        ]["location"]
-                    else:
-                        location_name_to_search = taskStructure["program"]["place"][
-                            "location"
-                        ]
-                    (
-                        location_id,
-                        location_name,
-                        location_keywords,
-                    ) = search_existing_libraries(
-                        user, Location, location_name_to_search
-                    )
-
-                    if (
-                        taskStructure["program"]["control"]["control_processing"][
-                            "action"
-                        ]
-                        is not None
-                        or taskStructure["program"]["processing"]["action"] is not None
-                    ):
-                        action_name_to_search = None
-                        if (
-                            taskStructure["program"]["control"]["control_processing"][
-                                "action"
-                            ]
-                            is not None
-                        ):
-                            action_name_to_search = taskStructure["program"]["control"][
-                                "control_processing"
-                            ]["action"]
-                        else:
-                            action_name_to_search = taskStructure["program"][
-                                "processing"
-                            ]["action"]
-                        (
-                            action_id,
-                            action_name,
-                            action_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Action,
-                            action_name_to_search,
-                        )
-                        taskCode["inputs"].update(
-                            {
-                                "DO": {
-                                    "block": {
-                                        "type": StepsItems.PICK.value,
-                                        "inputs": {
-                                            "OBJECT": {
-                                                "block": {
-                                                    "type": LibrariesItems.OBJECT.value,
-                                                    "data": dumps(
-                                                        {
-                                                            "id": object_id,
-                                                            "name": object_name,
-                                                            "keywords": object_keywords,
-                                                        }
-                                                    ),
-                                                    "fields": {"name": object_name},
-                                                }
-                                            }
-                                        },
-                                        "next": {
-                                            "block": {
-                                                "type": StepsItems.PROCESSING.value,
-                                                "inputs": {
-                                                    "ACTION": {
-                                                        "block": {
-                                                            "type": LibrariesItems.ACTION.value,
-                                                            "data": dumps(
-                                                                {
-                                                                    "id": action_id,
-                                                                    "name": action_name,
-                                                                    "keywords": action_keywords,
-                                                                }
-                                                            ),
-                                                            "fields": {
-                                                                "name": action_name
-                                                            },
-                                                        }
-                                                    }
-                                                },
-                                                "next": {
-                                                    "block": {
-                                                        "type": StepsItems.PLACE.value,
-                                                        "inputs": {
-                                                            "LOCATION": {
-                                                                "block": {
-                                                                    "type": LibrariesItems.LOCATION.value,
-                                                                    "data": dumps(
-                                                                        {
-                                                                            "id": location_id,
-                                                                            "name": location_name,
-                                                                            "keywords": location_keywords,
-                                                                        }
-                                                                    ),
-                                                                    "fields": {
-                                                                        "name": location_name
-                                                                    },
-                                                                }
-                                                            }
-                                                        },
-                                                    }
-                                                },
-                                            }
-                                        },
-                                    }
-                                }
-                            }
-                        )
-                    else:
-                        taskCode["inputs"].update(
-                            {
-                                "DO": {
-                                    "block": {
-                                        "type": StepsItems.PICK.value,
-                                        "inputs": {
-                                            "OBJECT": {
-                                                "block": {
-                                                    "type": LibrariesItems.OBJECT.value,
-                                                    "data": dumps(
-                                                        {
-                                                            "id": object_id,
-                                                            "name": object_name,
-                                                            "keywords": object_keywords,
-                                                        }
-                                                    ),
-                                                    "fields": {"name": object_name},
-                                                }
-                                            }
-                                        },
-                                        "next": {
-                                            "block": {
-                                                "type": StepsItems.PLACE.value,
-                                                "inputs": {
-                                                    "LOCATION": {
-                                                        "block": {
-                                                            "type": LibrariesItems.LOCATION.value,
-                                                            "data": dumps(
-                                                                {
-                                                                    "id": location_id,
-                                                                    "name": location_name,
-                                                                    "keywords": location_keywords,
-                                                                }
-                                                            ),
-                                                            "fields": {
-                                                                "name": location_name
-                                                            },
-                                                        }
-                                                    }
-                                                },
-                                            }
-                                        },
-                                    }
-                                }
-                            }
-                        )
-
-                    # Otherwise
-                    if (
-                        taskStructure["program"]["control"]["control_type"]
-                        == ChatLogicItems.WHEN_OTHERWISE.value
-                    ):
-                        (
-                            object_otherwise_id,
-                            object_otherwise_name,
-                            object_otherwise_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Object,
-                            taskStructure["program"]["control"]["otherwise"][
-                                "otherwise_pick"
-                            ]["object"],
-                        )
-
-                        (
-                            location_otherwise_id,
-                            location_otherwise_name,
-                            location_otherwise_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Location,
-                            taskStructure["program"]["control"]["otherwise"][
-                                "otherwise_place"
-                            ]["location"],
-                        )
-
-                        if (
-                            taskStructure["program"]["control"]["otherwise"][
-                                "otherwise_processing"
-                            ]
-                            is not None
-                            and taskStructure["program"]["control"]["otherwise"][
-                                "otherwise_processing"
-                            ]["action"]
-                        ):
-                            (
-                                action_otherwise_id,
-                                action_otherwise_name,
-                                action_otherwise_keywords,
-                            ) = search_existing_libraries(
-                                user,
-                                Action,
-                                taskStructure["program"]["control"]["otherwise"][
-                                    "otherwise_processing"
-                                ]["action"],
-                            )
-                            taskCode["inputs"].update(
-                                {
-                                    "OTHERWISE": {
-                                        "block": {
-                                            "type": StepsItems.PICK.value,
-                                            "inputs": {
-                                                "OBJECT": {
-                                                    "block": {
-                                                        "type": LibrariesItems.OBJECT.value,
-                                                        "data": dumps(
-                                                            {
-                                                                "id": object_otherwise_id,
-                                                                "name": object_otherwise_name,
-                                                                "keywords": object_otherwise_keywords,
-                                                            }
-                                                        ),
-                                                        "fields": {
-                                                            "name": object_otherwise_name
-                                                        },
-                                                    }
-                                                }
-                                            },
-                                            "next": {
-                                                "block": {
-                                                    "type": StepsItems.PROCESSING.value,
-                                                    "inputs": {
-                                                        "ACTION": {
-                                                            "block": {
-                                                                "type": LibrariesItems.ACTION.value,
-                                                                "data": dumps(
-                                                                    {
-                                                                        "id": action_otherwise_id,
-                                                                        "name": action_otherwise_name,
-                                                                        "keywords": action_otherwise_keywords,
-                                                                    }
-                                                                ),
-                                                                "fields": {
-                                                                    "name": action_otherwise_name
-                                                                },
-                                                            }
-                                                        }
-                                                    },
-                                                    "next": {
-                                                        "block": {
-                                                            "type": StepsItems.PLACE.value,
-                                                            "inputs": {
-                                                                "LOCATION": {
-                                                                    "block": {
-                                                                        "type": LibrariesItems.LOCATION.value,
-                                                                        "data": dumps(
-                                                                            {
-                                                                                "id": location_otherwise_id,
-                                                                                "name": location_otherwise_name,
-                                                                                "keywords": location_otherwise_keywords,
-                                                                            }
-                                                                        ),
-                                                                        "fields": {
-                                                                            "name": location_otherwise_name
-                                                                        },
-                                                                    }
-                                                                }
-                                                            },
-                                                        }
-                                                    },
-                                                }
-                                            },
-                                        }
-                                    }
-                                }
-                            )
-                        else:
-                            taskCode["inputs"].update(
-                                {
-                                    "OTHERWISE": {
-                                        "block": {
-                                            "type": StepsItems.PICK.value,
-                                            "inputs": {
-                                                "OBJECT": {
-                                                    "block": {
-                                                        "type": LibrariesItems.OBJECT.value,
-                                                        "data": dumps(
-                                                            {
-                                                                "id": object_otherwise_id,
-                                                                "name": object_otherwise_name,
-                                                                "keywords": object_otherwise_keywords,
-                                                            }
-                                                        ),
-                                                        "fields": {
-                                                            "name": object_otherwise_name
-                                                        },
-                                                    }
-                                                }
-                                            },
-                                            "next": {
-                                                "block": {
-                                                    "type": StepsItems.PLACE.value,
-                                                    "inputs": {
-                                                        "LOCATION": {
-                                                            "block": {
-                                                                "type": LibrariesItems.LOCATION.value,
-                                                                "data": dumps(
-                                                                    {
-                                                                        "id": location_otherwise_id,
-                                                                        "name": location_otherwise_name,
-                                                                        "keywords": location_otherwise_keywords,
-                                                                    }
-                                                                ),
-                                                                "fields": {
-                                                                    "name": location_otherwise_name
-                                                                },
-                                                            }
-                                                        }
-                                                    },
-                                                }
-                                            },
-                                        }
-                                    }
-                                }
-                            )
-
-                # No controls
-                elif taskStructure["program"]["control"]["control_type"] is None:
-                    object_id, object_name, object_keywords = search_existing_libraries(
-                        user,
-                        Object,
-                        taskStructure["program"]["pick"]["object"],
-                    )
-
-                    (
-                        location_id,
-                        location_name,
-                        location_keywords,
-                    ) = search_existing_libraries(
-                        user,
-                        Location,
-                        taskStructure["program"]["place"]["location"],
-                    )
-
-                    taskCode = {
-                        "type": StepsItems.PICK.value,
-                    }
-
-                    if (
-                        taskStructure["program"]["processing"] is not None
-                        and taskStructure["program"]["processing"]["action"]
-                    ):
-                        (
-                            action_id,
-                            action_name,
-                            action_keywords,
-                        ) = search_existing_libraries(
-                            user,
-                            Action,
-                            taskStructure["program"]["processing"]["action"],
-                        )
-                        taskCode["inputs"] = {
-                            "OBJECT": {
-                                "block": {
-                                    "type": LibrariesItems.OBJECT.value,
-                                    "data": dumps(
-                                        {
-                                            "id": object_id,
-                                            "name": object_name,
-                                            "keywords": object_keywords,
-                                        }
-                                    ),
-                                    "fields": {"name": object_name},
-                                }
-                            },
-                        }
-                        taskCode["next"] = {
-                            "block": {
-                                "type": StepsItems.PROCESSING.value,
-                                "inputs": {
-                                    "ACTION": {
-                                        "block": {
-                                            "type": LibrariesItems.ACTION.value,
-                                            "data": dumps(
-                                                {
-                                                    "id": action_id,
-                                                    "name": action_name,
-                                                    "keywords": action_keywords,
-                                                }
-                                            ),
-                                            "fields": {"name": action_name},
-                                        }
-                                    }
-                                },
-                                "next": {
-                                    "block": {
-                                        "type": StepsItems.PLACE.value,
-                                        "inputs": {
-                                            "LOCATION": {
-                                                "block": {
-                                                    "type": LibrariesItems.LOCATION.value,
-                                                    "data": dumps(
-                                                        {
-                                                            "id": location_id,
-                                                            "name": location_name,
-                                                            "keywords": location_keywords,
-                                                        }
-                                                    ),
-                                                    "fields": {"name": location_name},
-                                                }
-                                            }
-                                        },
-                                    }
-                                },
-                            },
-                        }
-                    else:
-                        taskCode["inputs"] = {
-                            "OBJECT": {
-                                "block": {
-                                    "type": LibrariesItems.OBJECT.value,
-                                    "data": dumps(
-                                        {
-                                            "id": object_id,
-                                            "name": object_name,
-                                            "keywords": object_keywords,
-                                        }
-                                    ),
-                                    "fields": {"name": object_name},
-                                }
-                            },
-                        }
-                        taskCode["next"] = {
-                            "block": {
-                                "type": StepsItems.PLACE.value,
-                                "inputs": {
-                                    "LOCATION": {
-                                        "block": {
-                                            "type": LibrariesItems.LOCATION.value,
-                                            "data": dumps(
-                                                {
-                                                    "id": location_id,
-                                                    "name": location_name,
-                                                    "keywords": location_keywords,
-                                                }
-                                            ),
-                                            "fields": {"name": location_name},
-                                        }
-                                    }
-                                },
-                            },
-                        }
-
-                date = getDateTimeNow()
-
-                Task.objects.filter(id=task_id).update(
-                    code=dumps(taskCode),
-                    last_modified=date,
-                )
-
-                response = {
-                    "taskCode": taskCode,
-                }
-                return success_response(response)
-            else:
-                return invalid_request_method()
-        else:
-            return unauthorized_request()
-    except Exception as e:
-        return error_response(str(e))
 
 
 def search_existing_libraries(
@@ -1333,87 +355,19 @@ def search_existing_libraries(
                 return None, name, None
 
 
-from dataclasses import dataclass
-from typing import List, Union, Optional, Literal
-
-
-@dataclass
-class SensorSignalCondition:
-    type: Literal["sensor_signal"]
-    sensor: str
-
-
-@dataclass
-class FindObjectCondition:
-    type: Literal["find_object"]
-    objectId: int
-    objectName: str
-
-
-@dataclass
-class HumanFeedbackCondition:
-    type: Literal["human_feedback"]
-
-
-AbstractCondition = Union[
-    SensorSignalCondition, FindObjectCondition, HumanFeedbackCondition
-]
-
-
-@dataclass
-class AbstractPickStep:
-    type: Literal["pick"]
-    objectId: int
-    objectName: str
-
-
-@dataclass
-class AbstractPlaceStep:
-    type: Literal["place"]
-    locationId: int
-    locationName: str
-
-
-@dataclass
-class AbstractProcessingStep:
-    type: Literal["processing"]
-    actionId: int
-    actionName: str
-
-
-@dataclass
-class AbstractRepeatStep:
-    type: Literal["repeat"]
-    times: int
-    steps: List["AbstractStep"]
-
-
-@dataclass
-class AbstractWhenStep:
-    type: Literal["when"]
-    condition: Optional[AbstractCondition]
-    do: List["AbstractStep"]
-    otherwise: Optional[List["AbstractStep"]] = None
-
-
-AbstractStep = Union[
-    AbstractPickStep,
-    AbstractPlaceStep,
-    AbstractProcessingStep,
-    AbstractRepeatStep,
-    AbstractWhenStep,
-]
-
 CHATGPT_INSTRUCTIONS_MULTIMODAL = """
 # OBJECTIVE #
 You are an assistant designed to extract user intents from natural language and convert them into or edit a collaborative robot task structured as a JSON program.
-The task program consists of sequential and conditional steps of the following types: "pick", "place", "processing", "repeat", and "when". You may need to create a new task or modify an existing one.
+The task program consists of sequential and conditional steps. You may need to create a new task or modify an existing one.
 Steps can be nested inside "steps", "do", or "otherwise" arrays to represent loops and conditions.
 
 You must reply with a JSON response that follows this format:
 {{
   "answer": string,       // Natural language explanation or clarification to the user
-  "task": AbstractStep[]  // The updated or created task program
+  "task": AbstractStep[], // The updated or created task program
+  "taskModified": boolean, // Set to true if you are proposing a new task, making changes, or editing the existing task in response to a user request to modify the workspace. Set to false if the user is only asking a question, asking to analyze the workspace, asking for explanations, or if no changes are being proposed to the workspace.
+  "intent": string,       // One of "explain", "analyze", "modify", "evaluate" — see # HOW YOU HELP # below
+  "lang": string          // BCP-47 code of the language used in "answer" (e.g. "en-US", "it")
 }}
 
 Where AbstractStep is one of:
@@ -1439,6 +393,62 @@ Where AbstractStep is one of:
       "actionName": string
     }}
 
+  - Move-To Step (moves the robot to a location without picking/placing):
+    {{
+      "type": "move_to",
+      "motionType": "LINEAR" | "JOINT",
+      "locationId": number,
+      "locationName": string
+    }}
+
+  - Gripper Step, legacy unified form (open or close the robot gripper) — prefer the two
+    separate steps below, which match the toolbox block names ("Open Gripper"/"Close Gripper")
+    the user actually sees:
+    {{
+      "type": "gripper",
+      "state": "OPEN" | "CLOSE"
+    }}
+
+  - Open Gripper Step / Close Gripper Step (no extra fields):
+    {{"type": "open_gripper"}}
+    {{"type": "close_gripper"}}
+
+  - Saved Task Step (runs a previously saved task, "Saved Tasks" category). Both the id and the
+    name MUST come from the Saved Tasks list in # DATABASE #, or be preserved exactly as found in
+    the snapshot. Never invent an id, and never guess a name from what the user said — if the
+    saved task they asked for is not in that list, change nothing and say which one is missing:
+    {{
+      "type": "macro_task",
+      "macroId": number,
+      "macroName": string
+    }}
+
+  - Wait Step (pause the robot for a set amount of seconds):
+    {{
+      "type": "wait",
+      "seconds": number
+    }}
+
+  - Human Action Step (pause the robot and show a message to the operator):
+    {{
+      "type": "human_action",
+      "description": string,
+      "confirmEvent": AbstractCondition | null
+    }}
+
+    - Notify Action Step (send a message to the operator without stopping the robot):
+    {{
+      "type": "notify_action",
+      "description": string
+    }}
+
+  - Repeat-Until Step:
+    {{
+      "type": "repeat_until",
+      "condition": AbstractCondition,
+      "do": AbstractStep[]
+    }}
+
   - Repeat Step:
     {{
       "type": "repeat",
@@ -1450,7 +460,7 @@ Where AbstractStep is one of:
     {{
       "type": "when",
       "condition": AbstractCondition | null,
-      "do": AbstractStep[],
+      "do": AbstractStep[]
     }}
 
   - When-Do-Otherwise Step:
@@ -1462,92 +472,29 @@ Where AbstractStep is one of:
     }}
 
 Conditions (AbstractCondition) can be one of:
-- {{"type": "sensor_signal", "sensor":  "camera" | "ir"}}
-- {{"type": "find_object", "objectId": number, "objectName": string}}
-- {{"type": "human_feedback"}}
+- {{"type": "find_object", "objectId": number, "objectName": string}}  // true while the camera sees the object
+- {{"type": "gesture", "gestureType": "THUMBS_UP" | "THUMBS_DOWN" | "OPEN_HAND" | "FIST" | "PEACE" | "OK"}}  // true when the camera sees that hand gesture
+- {{"type": "voice", "voiceWord": "YES" | "NO" | "DONE" | "PROCEED"}}  // true when the operator says that word out loud
+- {{"type": "timer", "seconds": number}}  // true once the given number of seconds has passed
+- {{"type": "and", "left": AbstractCondition, "right": AbstractCondition}}  // true only if BOTH inner conditions are true
+- {{"type": "or", "left": AbstractCondition, "right": AbstractCondition}}   // true if AT LEAST ONE inner condition is true
+- {{"type": "not", "condition": AbstractCondition}}                          // true when the inner condition is false
+
+These are the ONLY valid conditions. Use them for a "when" condition, a "repeat_until" condition, or a "human_action" confirmEvent. You may nest "and"/"or"/"not" to combine conditions (e.g. the camera sees the box AND 5 seconds have passed). NEVER invent other condition types (no "sensor_signal", no "touch_detect").
+A "human_action" confirmEvent may additionally be null or {{"type": "human_feedback"}} — both mean "wait for the operator to press confirm" (no sensor).
+
+# BLOCKLY TOOLBOX & CATEGORIES #
+These are the blocks available in the visual editor, grouped by the sidebar category the user sees. When you talk to the user, ALWAYS refer to a block by the exact user-facing name shown below (the part in quotes), and when they ask where a block is, tell them which category to open.
+
+{{blocks}}
+
+The "Twin Library" and "Saved Tasks" categories hold pills generated from the user's own data — the objects, locations and skills listed in the # DATABASE # section below, plus their previously saved tasks.
+If the user asks where to find a block or how blocks are organized, guide them to these categories by name.
 
 # CONNECTION RULES #
-These are the rules by which Blockly blocks can be connected:
-
-Blockly.Blocks.pick_block = {{
-  init() {{
-    this.setPreviousStatement(true, ['logic_pick_rel', 'place_pick_rel'])
-    this.setNextStatement(true, ['pick_place_rel', 'pick_processing_rel'])
-  }},
-}}
-
-Blockly.Blocks.place_block = {{
-  init() {{
-    this.setPreviousStatement(true, [
-      'pick_place_rel',
-      'processing_place_rel',
-      'when_otherwise_place_rel',
-    ])
-    this.setNextStatement(true, [
-      'place_repeat_rel',
-      'place_when_rel',
-      'place_when_otherwise_rel',
-      'place_pick_rel',
-    ])
-  }},
-}}
-
-Blockly.Blocks.processing_block = {{
-  init() {{
-    this.setNextStatement(true, [
-      'processing_place_rel',
-      'processing_processing_rel',
-      'processing_when_otherwise_rel',
-    ])
-    this.setPreviousStatement(true, [
-      'pick_processing_rel',
-      'processing_processing_rel',
-      'logic_processing_rel',
-    ])
-  }},
-}}
-
-Blockly.Blocks.when_otherwise_block = {{
-  init() {{
-    this.appendStatementInput('DO')
-        .setCheck([
-        'logic_pick_rel',
-        'logic_logic_rel',
-        'when_otherwise_place_rel',
-        ])
-    this.appendStatementInput('OTHERWISE')
-        .setCheck([
-        'logic_pick_rel',
-        'logic_logic_rel',
-        'when_otherwise_place_rel',
-        ])
-    this.setPreviousStatement(true, [
-      'logic_logic_rel',
-      'processing_when_otherwise_rel',
-      'place_when_otherwise_rel',
-    ])
-    this.setNextStatement(true, ['logic_logic_rel', 'logic_pick_rel','logic_processing_rel])
-  }},
-}}
-
-Blockly.Blocks.when_block = {{
-  init() {{
-    this.appendStatementInput('DO')
-        .setCheck(['logic_pick_rel', 'logic_logic_rel'])
-    this.setPreviousStatement(true, ['logic_logic_rel', 'place_when_rel'])
-    this.setNextStatement(true, ['logic_logic_rel', 'logic_pick_rel','logic_processing_rel])
-  }},
-}}
-
-Blockly.Blocks.repeat_block = {{
-  init() {{
-    this.appendStatementInput('DO')
-      .setCheck(['logic_pick_rel', 'logic_logic_rel'])
-    this.setPreviousStatement(true, ['logic_logic_rel', 'place_repeat_rel'])
-    this.setNextStatement(true, ['logic_logic_rel', 'logic_pick_rel','logic_processing_rel])
-  }},
-}}
-
+All step blocks can be freely chained in sequence. A condition can ONLY appear as the "condition" of a
+"when" step, the "condition" of a "repeat_until" step, or the "confirmEvent" of a "human_action" step —
+never on its own as a step in the task array.
 
 # CONTEXT #
 - The user is not an expert in robotics or programming.
@@ -1555,20 +502,61 @@ Blockly.Blocks.repeat_block = {{
 - You must interpret their requests accurately using only the provided database.
 - Always use the exact "objectId"/"objectName", "locationId"/"locationName", and "actionId"/"actionName" from the database.
 - If the request is ambiguous, incomplete, or references unknown items, respond **only** with a clear natural language question in "answer" asking for clarification and do not modify the task returning the task structure as it is.
-- Always reply with the language used by the user, even if it is not English.
+- The default language is English. You MUST reply in the language used by the user in their most recent message. If the user writes in English, reply in English. If the user writes in Italian, reply in Italian. Do not default or switch to Italian if the user's latest query is in English, even if previous parts of the chat log contain Italian.
+- The user is a beginner. Keep "answer" friendly, concrete and jargon-free. Explain WHY a step is needed, not just what it is. Prefer short sentences.
+- Set "lang" to the BCP-47 code of the language you wrote "answer" in (e.g. "en-US" for English, "it" for Italian). It is used to pick the text-to-speech voice.
+
+# HOW YOU HELP — set the "intent" field on every reply #
+Decide what the user wants and set "intent" to exactly one of "explain", "analyze", "modify", "evaluate":
+
+- "explain": the user asks what a block does, where to find it, or how something works.
+  → Explain it in plain words using the block's user-facing name and its category. Do NOT change the task. "task" = the current snapshot unchanged. taskModified = false.
+
+- "analyze": the user asks what is currently in their workspace ("what's in my task?", "cosa c'è nel workspace?") OR what the camera currently sees ("what do you see?", "quali provette vedi?").
+  → For workspace questions, describe the blocks in the # CURRENT TASK SNAPSHOT # in order, in plain words. For camera questions, answer from the "Live camera scene" list only — if it is "unavailable", say the camera is offline; never invent scene contents. Do NOT change anything. "task" = the snapshot unchanged. taskModified = false.
+
+- "modify": the user asks to build, add, remove, or change steps.
+  → Return the full updated task in "task" and set taskModified = true. Briefly describe the change in "answer" as something you are OFFERING, not something you have done: the workspace is NOT touched by your reply. What you return is shown to the user as a proposal they must accept or reject, and it is applied only if they accept. Write "Here's the task with the pick step set to 'tube'" or "I can set the pick step to 'tube'", never "I updated the pick step" — if they reject it, a past-tense sentence is left in the conversation claiming a change that never happened.
+  → When the request IS a modification but you CANNOT carry it out — the object, location, skill or saved task the user named is not in the # DATABASE # lists, or the request is too vague to tie to specific entities ("pick up the thing and put it somewhere") — the intent STAYS "modify". Set taskModified = false, return "task" = the snapshot unchanged, and in "answer" name exactly what is missing and ask for the specific object, location, skill or saved task. Do NOT switch to "explain": the user asked to change the task, and "explain" means they asked how something works. Do NOT invent a near-match from the lists to have something to return: proposing the wrong entity is worse than asking.
+
+- "evaluate": the user asks you to check, review, judge, or improve their task ("is this good?", "valuta il mio task", "what can I improve?").
+  → Give an honest, encouraging assessment in "answer": what works, what is risky or missing (e.g. picking without placing, a "When" with no condition, an object that may be too heavy), and how to fix it. Do NOT change the task unless they explicitly ask. taskModified = false. The app also runs its own automatic checks and shows them next to your assessment.
+
+# SUGGESTIONS — the "messageParts" field (optional) #
+Besides "answer", you MAY add short actionable tips as messageParts: a list of {{"type": "suggestion", "content": "..."}} items. Each suggestion is ONE concrete next step in plain language (e.g. "Add a 'Place at' step so the robot puts the object down"). Use them especially for "evaluate" and "explain". Keep each under ~12 words. If you have nothing useful to add, omit messageParts.
 
 # IMPORTANT INSTRUCTIONS #
-- Between a user request and the next one, the use may change the existing task structure using the Blockly interface. Always consider the latest task structure provided.
+- When responding to the user in natural language (the "answer" field), you MUST refer to blocks EXACTLY by their user-facing names in quotes as defined in the "# BLOCKLY TOOLBOX & CATEGORIES #" list (e.g. "Pick up" instead of "Pick" or "pick_block", "Pause and show message" instead of "human_action" or "Wait for Operator", "Show message" instead of "notify_action", "Repeat times" instead of "repeat_block", "Perform" instead of "processing_block", "Place at" instead of "place_block", etc.). Never use their technical type names (e.g. pick, place, processing, repeat, when, human_action, etc.) or generic code-like names in your conversational answers.
+- The "# CURRENT TASK SNAPSHOT #" is the ONLY ground truth for the actual state of the workspace. Do NOT assume that blocks discussed in previous turns of the conversation are in the workspace unless they are explicitly present in the "# CURRENT TASK SNAPSHOT #" of the current turn.
+- If the "# CURRENT TASK SNAPSHOT #" is empty (e.g. `[]`), then the workspace is currently empty, regardless of what was discussed in previous turns.
+- If the user asks about the current state, content, or blocks in the workspace, you MUST describe the blocks listed in "# CURRENT TASK SNAPSHOT #" exactly as they are, without modifying them, adding phantom blocks, or inventing steps. You must return the "task" field EXACTLY matching the provided "# CURRENT TASK SNAPSHOT #" array.
+- CRITICAL: You must NEVER flatten nested steps inside loops or conditionals in the "task" array. All steps inside "repeat" MUST be nested inside the "steps" array of that repeat step. All steps inside "when" or "repeat_until" MUST be nested inside the "do" or "otherwise" array of that block. Returning them as flat sibling steps in the root "task" array is strictly forbidden and will break the system. Keep the exact nested structure of any block program.
+- If the user's message is purely informational, analytical, or asking about the state/content of the workspace (e.g. "Cosa c'è nel mio workspace?", "Analizza il workspace"), you must NOT modify the task. You must return the "task" field EXACTLY matching the provided "# CURRENT TASK SNAPSHOT #" array structure, retaining its full nested representation without any changes.
+- You MUST set the "taskModified" field to true ONLY when you are proposing a new task, making changes, or editing the existing task in response to a user request to modify the workspace. You MUST set "taskModified" to false when the user is only asking a question, asking to analyze the workspace, asking for explanations, or if no changes are being proposed to the workspace.
+- Between a user request and the next one, the user may change the existing task structure using the Blockly interface. Always consider the latest task structure provided.
 - If no modifications are needed, return the existing task structure as it is.
 - Task sequence must be only one. So don't return an array of tasks (i.e., don't return "task": [[AbstractStep], [AbstractStep], ...]).
-- Always create a task compatible with the rules defined in the Blockly CONNECTION RULES section.
 - By default, if the user asks for a request, modify the existing task. Only if the user explicitly asks for a new task, create a new one from scratch.
+
+# HOW TO EDIT/MODIFY THE CURRENT TASK SNAPSHOT #
+When the user asks to add, remove, or modify steps relative to the existing workspace task snapshot:
+1. Locate the target step or container block in the "# CURRENT TASK SNAPSHOT #" array (e.g. a "repeat", "repeat_until", "when", or "human_action" step).
+2. If the user asks to insert steps "inside" or "in" a loop or conditional block:
+   - For a "Repeat times" block (type "repeat"): insert the nested steps inside its "steps" array.
+   - For a "Repeat until" block (type "repeat_until"): insert the nested steps inside its "do" array.
+   - For a "When → Do" block (type "when"): insert the nested steps inside its "do" array.
+3. If the user asks to set a confirmation event or sensor trigger for a "Pause and show message" block (type "human_action"):
+   - Set or update its "confirmEvent" property with the correct condition object (e.g., {"type": "gesture", "gestureType": "OPEN_HAND"}).
+4. Ensure all other unmodified steps in the task tree are preserved exactly as they are in their correct nested positions, without flattening them or creating unrelated blocks (like adding "when" blocks externally).
+5. EVERY step you return must be a COMPLETE step object carrying its own "type", including a step you only partially changed. Never return a partial object holding just the fields you edited: to change the object of a "pick" step, return the whole step {"type": "pick", "objectId": ..., "objectName": ...}, not {"objectName": ...}. A step without "type" cannot be matched to a block and is discarded, which silently removes that step from the user's program even though your answer says you changed it.
 
 # DATABASE #
 You have access to the following lists (always use exact IDs and names):
-- Objects: {objects}
-- Locations: {locations}
-- Actions: {actions}
+- Objects: {{objects}}
+- Locations: {{locations}}
+- Actions: {{actions}}
+- Saved Tasks (previously saved programs this user can run as one step; use ONLY these ids/names for a "macro_task" step): {{macros}}
+- Live camera scene (what the robot camera sees RIGHT NOW, aggregated by type and cap colour; "cap" entries are coloured test-tube caps; [] = nothing visible; "unavailable" = camera offline — never invent scene contents): {{scene}}
 
 # EXAMPLES #
 User says: "Pick the widget and place it in the bin A."
@@ -1578,9 +566,138 @@ Response:
   "task": [
       {{"type": "pick", "objectId": 3, "objectName": "widget"}},
       {{"type": "place", "locationId": 2, "locationName": "bin A"}}
-    ]
+    ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "Move to the inspection zone then open the gripper."
+Response:
+{{
+  "answer": "I added a move-to step towards the inspection zone followed by an open-gripper step.",
+  "task": [
+      {{"type": "move_to", "motionType": "LINEAR", "locationId": 5, "locationName": "inspection zone"}},
+      {{"type": "open_gripper"}}
+    ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "Wait for the operator to put a part on the table before starting."
+Response:
+{{
+  "answer": "I added a 'Pause and show message' step: the robot waits for the operator to confirm before starting.",
+  "task": [
+      {{"type": "human_action", "description": "Please place the part on the table and confirm.", "confirmEvent": {{"type": "human_feedback"}}}}
+    ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "Repeat 2 times: pick a tube and then wait 3 seconds."
+Response:
+{{
+  "answer": "I added a 'Repeat times' loop that runs twice: each time it picks up a 'tube' and then waits 3 seconds.",
+  "task": [
+    {{
+      "type": "repeat",
+      "times": 2,
+      "steps": [
+        {{"type": "pick", "objectId": 1, "objectName": "tube"}},
+        {{"type": "wait", "seconds": 3}}
+      ]
+    }}
+  ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "Keep picking tubes and placing them in the waste bin until the bin is no longer in view."
+Response:
+{{
+  "answer": "I added a 'Repeat until' loop: the robot keeps picking 'tube' and placing it at 'waste bin', and stops once the camera no longer sees the bin.",
+  "task": [
+    {{
+      "type": "repeat_until",
+      "condition": {{"type": "not", "condition": {{"type": "find_object", "objectId": 3, "objectName": "waste bin"}}}},
+      "do": [
+        {{"type": "pick", "objectId": 4, "objectName": "tube"}},
+        {{"type": "place", "locationId": 3, "locationName": "waste bin"}}
+      ]
+    }}
+  ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "If the camera sees the widget, pick it up, otherwise wait 5 seconds."
+Response:
+{{
+  "answer": "I added a 'When → Do / Otherwise' block: if the camera sees 'widget' the robot picks it up, otherwise it waits 5 seconds.",
+  "task": [
+    {{
+      "type": "when",
+      "condition": {{"type": "find_object", "objectId": 3, "objectName": "widget"}},
+      "do": [
+        {{"type": "pick", "objectId": 3, "objectName": "widget"}}
+      ],
+      "otherwise": [
+        {{"type": "wait", "seconds": 5}}
+      ]
+    }}
+  ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "Only pick the widget when the camera sees it AND you see a thumbs up."
+Response:
+{{
+  "answer": "I added a 'When → Do' block that combines two conditions with AND: the robot picks 'widget' only when the camera sees it and detects a thumbs-up gesture.",
+  "task": [
+    {{
+      "type": "when",
+      "condition": {{"type": "and", "left": {{"type": "find_object", "objectId": 3, "objectName": "widget"}}, "right": {{"type": "gesture", "gestureType": "THUMBS_UP"}}}},
+      "do": [
+        {{"type": "pick", "objectId": 3, "objectName": "widget"}}
+      ]
+    }}
+  ],
+  "taskModified": true,
+  "intent": "modify",
+  "lang": "en-US"
+}}
+
+User says: "What does the Pick up block do?"
+Response:
+{{
+  "answer": "'Pick up' tells the robot to grab an object. You drop an item from the 'Twin Library' into it to choose what to pick. You'll find it in the 'Robot Actions' category.",
+  "task": [],
+  "taskModified": false,
+  "intent": "explain",
+  "lang": "en-US"
+}}
+
+User says: "Is my task any good?" (snapshot: a single 'Pick up' step for 'widget', no place)
+Response:
+{{
+  "answer": "Good start! The robot picks up 'widget', but it never puts it down — it will keep holding it. Add a 'Place at' step to tell it where to set the object.",
+  "task": [{{"type": "pick", "objectId": 3, "objectName": "widget"}}],
+  "taskModified": false,
+  "intent": "evaluate",
+  "lang": "en-US",
+  "messageParts": [
+    {{"type": "suggestion", "content": "Add a 'Place at' step after the pick"}}
+  ]
 }}
 """
+
 
 CHATGPT_FUNCTION_MULTIMODAL = {
     "type": "function",
@@ -1592,141 +709,545 @@ CHATGPT_FUNCTION_MULTIMODAL = {
             "properties": {
                 "answer": {
                     "type": "string",
-                    "description": "Natural language explanation shown to the user",
+                    "description": "Natural language explanation shown to the user. Plain text — write real \" characters and real → arrows directly, do NOT backslash-escape quotes or use \\uXXXX sequences here (that JSON-string-escaping style is only for the 'task' field below, never for 'answer').",
                 },
                 "task": {
+                    "type": "string",
+                    "description": "Sequence of robot steps (following the AbstractStep format from instructions). MUST BE A VALID JSON STRING OF AN ARRAY (e.g. \"[{\\\"type\\\": \\\"pick\\\", \\\"objectId\\\": 4, \\\"objectName\\\": \\\"tube\\\"}]\"). Return an empty array string \"[]\" if empty.",
+                },
+                "taskModified": {
+                    "type": "boolean",
+                    "description": "Set to true ONLY if you are proposing a new task, making changes, or editing the existing task in response to a user request to modify the workspace. Set to false if the user is only asking a question, asking to analyze the workspace, asking for explanations, or if no changes are being proposed to the workspace.",
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["explain", "analyze", "modify", "evaluate"],
+                    "description": "What the user wants this turn. 'explain' = describe a block/how it works; 'analyze' = describe the current workspace; 'modify' = add/remove/change steps, INCLUDING when you cannot carry the change out because the entity named does not exist or the request is too vague (then taskModified = false and you ask for the missing entity); 'evaluate' = review/judge the task. See the # HOW YOU HELP # section.",
+                },
+                "lang": {
+                    "type": "string",
+                    "description": "BCP-47 code of the language you wrote 'answer' in (e.g. 'en-US', 'it'). Used to pick the text-to-speech voice.",
+                },
+                "messageParts": {
                     "type": "array",
-                    "description": "Sequence of robot steps",
+                    "description": "Optional short actionable suggestions shown to the user as chips. Each item is one concrete next step in plain language. Omit if you have nothing useful to add.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "type": {
-                                "type": "string",
-                                "enum": [
-                                    "pick",
-                                    "place",
-                                    "processing",
-                                    "repeat",
-                                    "when",
-                                ],
-                                "description": "Step type",
-                            },
-                            "objectId": {
-                                "type": "integer",
-                                "description": "Object ID (for step pick)",
-                            },
-                            "objectName": {
-                                "type": "string",
-                                "description": "Object name (for step pick)",
-                            },
-                            "locationId": {
-                                "type": "integer",
-                                "description": "Location ID (for step place)",
-                            },
-                            "locationName": {
-                                "type": "string",
-                                "description": "Location name (for step place)",
-                            },
-                            "actionId": {
-                                "type": "integer",
-                                "description": "Action ID (for step processing)",
-                            },
-                            "actionName": {
-                                "type": "string",
-                                "description": "Action name (for step processing)",
-                            },
-                            "times": {
-                                "type": "integer",
-                                "description": "Number of repetitions (for step repeat)",
-                            },
-                            "condition": {
-                                "type": "object",
-                                "description": "Condition for step when",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "enum": [
-                                            "sensor_signal",
-                                            "find_object",
-                                            "human_feedback",
-                                        ],
-                                        "description": "Condition type",
-                                    },
-                                    "sensor": {
-                                        "type": "string",
-                                        "description": "Sensor name (for sensor_signal condition)",
-                                    },
-                                    "objectId": {
-                                        "type": "integer",
-                                        "description": "Object ID (for find_object condition)",
-                                    },
-                                    "objectName": {
-                                        "type": "string",
-                                        "description": "Object name (for find_object condition)",
-                                    },
-                                },
-                            },
-                            "do": {
-                                "type": "array",
-                                "description": "Steps to execute when condition is met (for step when)",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "pick",
-                                                "place",
-                                                "processing",
-                                                "repeat",
-                                                "when",
-                                            ],
-                                            "description": "Step type",
-                                        },
-                                    },
-                                    "required": ["type"],
-                                },
-                            },
-                            "otherwise": {
-                                "type": "array",
-                                "description": "Steps to execute when condition is not met (for step when)",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "pick",
-                                                "place",
-                                                "processing",
-                                                "repeat",
-                                                "when",
-                                            ],
-                                            "description": "Step type",
-                                        },
-                                    },
-                                    "required": ["type"],
-                                },
-                            },
+                            "type": {"type": "string", "enum": ["suggestion"]},
+                            "content": {"type": "string"},
                         },
-                        "required": ["type"],
+                        "required": ["type", "content"],
                     },
                 },
             },
             "additionalProperties": False,
-            "required": ["answer", "task"],
-            "strict": True,
+            "required": ["answer", "task", "taskModified", "intent", "lang"],
         },
     },
 }
 
-CHATGPT_NEW_MESSAGE_MULTIMODAL = """
-# User Request #
-{message}
 
-# Actual Task Structure #
-{task}
-"""
+def fix_stray_json_escapes(text: str) -> str:
+    """Defensive normalization for a known LLM formatting slip: the model
+    occasionally JSON-escapes free text (the 'answer' field, suggestion
+    chips) as if it were going to be re-embedded in JSON — likely pattern-
+    matching the 'task' field's own schema example, which is documented as
+    a JSON-string-encoded array right next to plain-text fields. That leaves
+    literal backslash-quote (\\") and \\uXXXX sequences visible in text the
+    user actually reads instead of a real " or →. The prompt now tells the
+    model not to do this, but LLM instruction-following isn't guaranteed, so
+    this undoes just those two specific patterns — narrow enough not to
+    mangle a legitimate backslash (e.g. in a Windows-style path) the model
+    might type on purpose.
+    """
+    if not text or "\\" not in text:
+        return text
+    text = text.replace('\\"', '"')
+    text = re.sub(
+        r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text
+    )
+    return text
+
+
+def is_unfilled_slot(entity_id, entity_name):
+    """True when a step's entity slot was never filled in, rather than filled wrong.
+
+    A block dropped on the canvas starts with a shadow placeholder — "Select
+    Object", "Select Location", "Select Skill" (blocks/definitions.ts) — and a
+    null id. That is the normal state of a task being built, and the snapshot
+    sent to the model contains it verbatim; the model echoes it back, correctly,
+    whenever it answers without changing that step (asking a clarifying question,
+    for instance).
+
+    Treating that as "object not found" made it an ERROR, and one error anywhere
+    discards the whole proposal — so asking the assistant a question about a task
+    with any empty slot returned no proposal at all, repeatedly. The user's own
+    unfinished work was being read as a malformed model output.
+
+    The id is the signal, not the label: matching the placeholder text would
+    couple this to UI copy that is meant to be freely editable. A name that IS
+    given but matches nothing in the database stays an error — that is a
+    hallucinated entity, a real fault worth stopping for. Unfilled slots are
+    already surfaced to the user on the canvas itself, by the conformance
+    check's warning icon, and they block Publish there.
+    """
+    if entity_id is not None:
+        return False
+    if not entity_name:
+        return True
+    return str(entity_name).strip().lower().rstrip('.').startswith('select ')
+
+
+def unwrap_branch_envelopes(task):
+    """Flatten `[{"isMain": bool, "steps": [...]}, ...]` into a plain step list.
+
+    The workspace snapshot handed to the model is NOT in the same shape as the
+    `task` we ask it to return. The frontend builds the snapshot with
+    `blocklyToAbstractAll` (utils/blocklyParser.ts), which emits one *branch*
+    envelope per top-level stack — `{isMain, steps}` — while the function
+    schema and the AbstractStep docs describe a flat array of steps.
+
+    The prompt then tells the model, more than once, to return the "task" field
+    exactly matching the snapshot array. Following that instruction produces
+    envelopes, and an envelope has no "type", so validate_step dropped it as a
+    malformed step — taking the entire program with it, since the envelope is
+    usually the only top-level element. The model was doing as it was told.
+
+    Accepting both shapes here is the fix that cannot regress: the snapshot
+    format stays as it is, an echoed snapshot round-trips, and a flat array
+    passes through untouched. Non-main branches are kept too — they are the
+    user's disconnected stacks, and silently dropping them would delete work.
+    """
+    if not isinstance(task, list):
+        return task
+    if not any(
+        isinstance(entry, dict) and "type" not in entry and isinstance(entry.get("steps"), list)
+        for entry in task
+    ):
+        return task
+
+    flattened = []
+    for entry in task:
+        if isinstance(entry, dict) and "type" not in entry and isinstance(entry.get("steps"), list):
+            flattened.extend(entry["steps"])
+        else:
+            flattened.append(entry)
+    return flattened
+
+
+def repair_flattened_steps(steps, warnings=None):
+    if not isinstance(steps, list):
+        return steps
+
+    repaired = []
+    i = 0
+    while i < len(steps):
+        step = steps[i]
+        if not isinstance(step, dict):
+            repaired.append(step)
+            i += 1
+            continue
+
+        step_type = step.get("type")
+
+        # Unify children keys based on block types to prevent fallback gaps
+        if step_type == "repeat":
+            has_do = "do" in step and isinstance(step["do"], list) and len(step["do"]) > 0
+            has_steps = "steps" in step and isinstance(step["steps"], list) and len(step["steps"]) > 0
+            if has_do and not has_steps:
+                step["steps"] = step.pop("do")
+                if "do" in step:
+                    del step["do"]
+        elif step_type == "repeat_until":
+            has_do = "do" in step and isinstance(step["do"], list) and len(step["do"]) > 0
+            has_steps = "steps" in step and isinstance(step["steps"], list) and len(step["steps"]) > 0
+            if has_steps and not has_do:
+                step["do"] = step.pop("steps")
+                if "steps" in step:
+                    del step["steps"]
+
+        # Recursive repair of children first if they exist
+        if step_type == "repeat":
+            if "steps" in step and isinstance(step["steps"], list):
+                step["steps"] = repair_flattened_steps(step["steps"], warnings)
+        elif step_type in ["repeat_until", "when"]:
+            if "do" in step and isinstance(step["do"], list):
+                step["do"] = repair_flattened_steps(step["do"], warnings)
+            if step_type == "when" and "otherwise" in step and isinstance(step["otherwise"], list):
+                step["otherwise"] = repair_flattened_steps(step["otherwise"], warnings)
+
+        # Check if this is an empty container at the current level, followed by some sibling steps that should be nested
+        is_empty_container = False
+        children_key = None
+
+        if step_type == "repeat":
+            children_key = "steps"
+            is_empty_container = (children_key not in step) or (not isinstance(step[children_key], list)) or (len(step[children_key]) == 0)
+        elif step_type in ["repeat_until", "when"]:
+            children_key = "do"
+            is_empty_container = (children_key not in step) or (not isinstance(step[children_key], list)) or (len(step[children_key]) == 0)
+
+        if is_empty_container and children_key is not None:
+            subsequent_siblings = steps[i + 1:]
+            if subsequent_siblings:
+                if warnings is not None:
+                    warnings.append({
+                        "severity": "warning",
+                        "message": f"Auto-corrected: flattened steps were nested inside the empty '{step_type}' container."
+                    })
+                nested_siblings = repair_flattened_steps(subsequent_siblings, warnings)
+                step[children_key] = nested_siblings
+                repaired.append(step)
+                i = len(steps)
+                continue
+
+        repaired.append(step)
+        i += 1
+
+    return repaired
+
+
+def format_blocks_catalog(data_blocks) -> str:
+    """Render the block catalog (sent by the frontend from the toolbox registry)
+    into the readable list templated into {{blocks}} of the system prompt.
+
+    Keeping the catalog frontend-driven avoids drift: block names and
+    descriptions always match what the user actually sees in the toolbox.
+    """
+    if not data_blocks:
+        return "(block catalog unavailable)"
+    lines = []
+    for idx, category in enumerate(data_blocks, start=1):
+        name = category.get("category") or category.get("name") or "?"
+        lines.append(f'{idx}. "{name}":')
+        for block in category.get("blocks", []):
+            label = block.get("label", "?")
+            if block.get("dynamic"):
+                lines.append(f'   - "{label}": pills generated from your saved items.')
+                continue
+            desc = block.get("description") or ""
+            inputs = block.get("inputs")
+            extra = f" (accepts: {inputs})" if inputs and inputs.lower() != "none" else ""
+            lines.append(f'   - "{label}": {desc}{extra}')
+    return "\n".join(lines)
+
+
+def validate_condition(condition, cond_index, warnings, data_objects):
+    if not isinstance(condition, dict):
+        warnings.append({"severity": "error", "message": f"Condition {cond_index}: must be object."})
+        return
+    cond_type = condition.get("type")
+    if cond_type == "find_object":
+        object_id = condition.get("objectId")
+        object_name = condition.get("objectName")
+        obj = None
+        for o in data_objects:
+            if (object_id is not None and str(o["id"]) == str(object_id)) or \
+               (object_id is not None and o.get("name") and o["name"].lower() == str(object_id).lower()) or \
+               (object_name and o.get("name") and o["name"].lower() == object_name.lower()):
+                obj = o
+                break
+        if obj is None:
+            warnings.append({"severity": "error", "message": f"Condition {cond_index}: unknown object '{object_name or object_id}'."})
+        else:
+            condition["objectId"] = obj["id"]
+            condition["objectName"] = obj["name"]
+    elif cond_type == "gesture":
+        gesture_type = condition.get("gestureType")
+        if gesture_type not in ["THUMBS_UP", "THUMBS_DOWN", "OPEN_HAND", "FIST", "PEACE", "OK"]:
+            warnings.append({"severity": "error", "message": f"Condition {cond_index}: invalid gestureType."})
+    elif cond_type == "voice":
+        voice_word = condition.get("voiceWord")
+        if voice_word not in ["YES", "NO", "DONE", "PROCEED"]:
+            warnings.append({"severity": "error", "message": f"Condition {cond_index}: invalid voiceWord."})
+    elif cond_type == "timer":
+        if not isinstance(condition.get("seconds"), (int, float)) or condition.get("seconds") < 0:
+            warnings.append({"severity": "error", "message": f"Condition {cond_index}: invalid seconds."})
+    elif cond_type == "human_feedback":
+        pass
+    elif cond_type in ("and", "or"):
+        validate_condition(condition.get("left"), f"{cond_index}.{cond_type}.left", warnings, data_objects)
+        validate_condition(condition.get("right"), f"{cond_index}.{cond_type}.right", warnings, data_objects)
+    elif cond_type == "not":
+        validate_condition(condition.get("condition"), f"{cond_index}.not", warnings, data_objects)
+    else:
+        warnings.append({"severity": "error", "message": f"Condition {cond_index}: unknown condition type '{cond_type}'."})
+
+
+def validate_step(step, step_index, warnings, data_objects, data_locations, data_actions,
+                  data_macros=None):
+    if not isinstance(step, dict):
+        # A malformed/misplaced token from a bad tool-call parse (e.g. a
+        # flattened-container repair mistaking a literal key like "do" for a
+        # sibling step) — drop it as a warning rather than crash the whole
+        # proposal on step.get() below.
+        warnings.append({"severity": "warning", "message": f"Step {step_index}: expected an object, got {type(step).__name__}; dropped."})
+        return None
+    step_copy = copy.deepcopy(step)
+    step_type = step.get("type")
+
+    if step_type == "pick":
+        object_id = step.get("objectId")
+        object_name = step.get("objectName")
+        obj = None
+        for obj_item in data_objects:
+            if (object_id is not None and str(obj_item["id"]) == str(object_id)) or \
+               (object_id is not None and obj_item.get("name") and obj_item["name"].lower() == str(object_id).lower()) or \
+               (object_name and obj_item.get("name") and obj_item["name"].lower() == object_name.lower()):
+                obj = obj_item
+                break
+        if obj is None and is_unfilled_slot(object_id, object_name):
+            # Slot never filled in — the user's own in-progress state,
+            # echoed back from the snapshot. Keep the step as it is.
+            pass
+        elif obj is None:
+            warnings.append({
+                "severity": "error",
+                "message": f"Pick step {step_index}: object '{object_name or object_id}' not found."
+            })
+        else:
+            step_copy["objectId"] = obj["id"]
+            step_copy["objectName"] = obj["name"]
+
+    elif step_type == "place":
+        location_id = step.get("locationId")
+        location_name = step.get("locationName")
+        loc = None
+        for loc_item in data_locations:
+            if (location_id is not None and str(loc_item["id"]) == str(location_id)) or \
+               (location_id is not None and loc_item.get("name") and loc_item["name"].lower() == str(location_id).lower()) or \
+               (location_name and loc_item.get("name") and loc_item["name"].lower() == location_name.lower()):
+                loc = loc_item
+                break
+        if loc is None and is_unfilled_slot(location_id, location_name):
+            # Slot never filled in — the user's own in-progress state,
+            # echoed back from the snapshot. Keep the step as it is.
+            pass
+        elif loc is None:
+            warnings.append({
+                "severity": "error",
+                "message": f"Place step {step_index}: location '{location_name or location_id}' not found."
+            })
+        else:
+            step_copy["locationId"] = loc["id"]
+            step_copy["locationName"] = loc["name"]
+
+    elif step_type == "processing":
+        action_id = step.get("actionId")
+        action_name = step.get("actionName")
+        act = None
+        for act_item in data_actions:
+            if (action_id is not None and str(act_item["id"]) == str(action_id)) or \
+               (action_id is not None and act_item.get("name") and act_item["name"].lower() == str(action_id).lower()) or \
+               (action_name and act_item.get("name") and act_item["name"].lower() == action_name.lower()):
+                act = act_item
+                break
+        if act is None and is_unfilled_slot(action_id, action_name):
+            # Slot never filled in — the user's own in-progress state,
+            # echoed back from the snapshot. Keep the step as it is.
+            pass
+        elif act is None:
+            warnings.append({
+                "severity": "error",
+                "message": f"Processing step {step_index}: action '{action_name or action_id}' not found."
+            })
+        else:
+            step_copy["actionId"] = act["id"]
+            step_copy["actionName"] = act["name"]
+
+    elif step_type == "move_to":
+        location_id = step.get("locationId")
+        location_name = step.get("locationName")
+        motion_type = step.get("motionType")
+        loc = None
+        for loc_item in data_locations:
+            if (location_id is not None and str(loc_item["id"]) == str(location_id)) or \
+               (location_id is not None and loc_item.get("name") and loc_item["name"].lower() == str(location_id).lower()) or \
+               (location_name and loc_item.get("name") and loc_item["name"].lower() == location_name.lower()):
+                loc = loc_item
+                break
+        if loc is None and is_unfilled_slot(location_id, location_name):
+            # Slot never filled in — same reasoning as the pick/place branches.
+            pass
+        elif loc is None:
+            warnings.append({
+                "severity": "error",
+                "message": f"MoveTo step {step_index}: location '{location_name or location_id}' not found."
+            })
+        else:
+            step_copy["locationId"] = loc["id"]
+            step_copy["locationName"] = loc["name"]
+        if motion_type not in ["LINEAR", "JOINT"]:
+            warnings.append({
+                "severity": "error",
+                "message": f"MoveTo step {step_index}: invalid motionType '{motion_type}'."
+            })
+
+    elif step_type == "gripper":
+        state = step.get("state")
+        if state not in ["OPEN", "CLOSE"]:
+            warnings.append({
+                "severity": "error",
+                "message": f"Gripper step {step_index}: invalid state '{state}'."
+            })
+
+    elif step_type == "wait":
+        seconds = step.get("seconds")
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            warnings.append({
+                "severity": "error",
+                "message": f"Wait step {step_index}: invalid seconds '{seconds}'."
+            })
+
+    elif step_type == "human_action":
+        # Read/validate on step_copy, not step: validate_condition mutates the
+        # condition dict in place (DB id/name normalization) and step_copy is
+        # what gets returned — mutating the original left the fix discarded.
+        confirm_event = step_copy.get("confirmEvent")
+        if confirm_event is not None:
+            validate_condition(confirm_event, f"{step_index}.human_action.confirmEvent", warnings, data_objects)
+
+    elif step_type == "notify_action":
+        if not isinstance(step.get("description"), str):
+            warnings.append({
+                "severity": "error",
+                "message": f"NotifyAction step {step_index}: description must be a string."
+            })
+
+    elif step_type in ("open_gripper", "close_gripper"):
+        # No fields to check — the open/closed state is the type itself.
+        # Real, toolbox-reachable blocks (definitions.ts, toolboxRegistry.ts);
+        # without this branch they fell into the "unknown type" catch-all
+        # below and were silently dropped from any chat-touched proposal,
+        # including ones the user built by hand and never asked to change.
+        pass
+
+    elif step_type == "macro_task":
+        # Checked against the real catalogue, like every other entity. A presence check
+        # on `macroId` alone let the model invent a saved task (it appended
+        # `macroName: "dispose"` for one that does not exist and reported success), so
+        # the prompt lists the user's saved tasks and this validates against them.
+        #
+        # `error`, not `warning`, deliberately: severity here decides whether the WHOLE
+        # proposal is discarded (see `is_valid` in new_message_multimodal). A
+        # hallucinated entity is the case CLAUDE.md reserves that for, and an invented
+        # saved task is worse than an invented object because a macro is a whole
+        # sub-program. As a warning it would be dropped silently and the rest of the
+        # proposal applied, so the operator would accept a task that quietly lost the
+        # step they asked for.
+        macro_id = step.get("macroId")
+        macro_name = step.get("macroName")
+        macro = None
+        for macro_item in (data_macros or []):
+            if (macro_id is not None and str(macro_item.get("id")) == str(macro_id)) or \
+               (macro_name and macro_item.get("name")
+                    and macro_item["name"].lower() == str(macro_name).lower()):
+                macro = macro_item
+                break
+        if macro is None and is_unfilled_slot(macro_id, macro_name):
+            # A Saved Task block dropped on the canvas and not yet pointed at
+            # anything — the user's own work in progress, echoed back from the
+            # snapshot. Same rule as every other unfilled slot.
+            pass
+        elif macro is None:
+            warnings.append({
+                "severity": "error",
+                "message": (
+                    f"Saved Task step {step_index}: "
+                    f"'{macro_name or macro_id}' is not one of this user's saved tasks."
+                )
+            })
+        else:
+            # Pin BOTH, from the catalogue. A right name with a stale id is
+            # what makes a Saved Task block fail at run time in front of the
+            # robot (`_h_macro` resolves by id), and the model is echoing ids
+            # out of a snapshot that may predate a delete-and-recreate.
+            step_copy["macroId"] = macro["id"]
+            step_copy["macroName"] = macro["name"]
+
+    elif step_type == "repeat":
+        times = step.get("times")
+        steps = step.get("steps")
+        if not steps:  # fallback if steps is None or empty list []
+            steps = step.get("do", [])
+        if not isinstance(times, int) or times <= 0:
+            warnings.append({
+                "severity": "error",
+                "message": f"Repeat step {step_index}: invalid times '{times}'."
+            })
+        validated_children = []
+        for i, sub_step in enumerate(steps):
+            validated_sub_step = validate_step(sub_step, f"{step_index}.repeat[{i}]", warnings, data_objects, data_locations, data_actions, data_macros)
+            if validated_sub_step is not None:
+                validated_children.append(validated_sub_step)
+        step_copy["steps"] = validated_children
+
+    elif step_type == "repeat_until":
+        # See human_action above: read/validate on step_copy so the DB
+        # normalization validate_condition applies in place actually sticks.
+        condition = step_copy.get("condition")
+        steps = step.get("do")
+        if not steps:  # fallback if do is None or empty list []
+            steps = step.get("steps", [])
+        if condition is not None:
+            validate_condition(condition, f"{step_index}.repeat_until.condition", warnings, data_objects)
+        validated_children = []
+        for i, sub_step in enumerate(steps):
+            validated_sub_step = validate_step(sub_step, f"{step_index}.repeat_until[{i}]", warnings, data_objects, data_locations, data_actions, data_macros)
+            if validated_sub_step is not None:
+                validated_children.append(validated_sub_step)
+        step_copy["do"] = validated_children
+
+    elif step_type == "when":
+        # See human_action above: read/validate on step_copy so the DB
+        # normalization validate_condition applies in place actually sticks.
+        condition = step_copy.get("condition")
+        do_steps = step.get("do", [])
+        otherwise_steps = step.get("otherwise", [])
+        if condition is not None:
+            validate_condition(condition, f"{step_index}.when.condition", warnings, data_objects)
+        validated_do = []
+        for i, sub_step in enumerate(do_steps):
+            validated_sub_step = validate_step(sub_step, f"{step_index}.when.do[{i}]", warnings, data_objects, data_locations, data_actions, data_macros)
+            if validated_sub_step is not None:
+                validated_do.append(validated_sub_step)
+        step_copy["do"] = validated_do
+        if otherwise_steps is not None:
+            validated_otherwise = []
+            for i, sub_step in enumerate(otherwise_steps):
+                validated_sub_step = validate_step(sub_step, f"{step_index}.when.otherwise[{i}]", warnings, data_objects, data_locations, data_actions, data_macros)
+                if validated_sub_step is not None:
+                    validated_otherwise.append(validated_sub_step)
+            step_copy["otherwise"] = validated_otherwise
+
+    else:
+        # A step with no recognizable type is a malformed LLM output, not a real step to
+        # show the user: drop it instead of passing a phantom entry through to the
+        # proposed-task preview (callers must filter the None out, see the recursive
+        # validate_step(...) call sites above). Warning, not error: dropping it already
+        # keeps garbage out of the workspace, so the rest of an otherwise-valid proposal
+        # shouldn't be discarded wholesale over one malformed step (is_valid only looks
+        # at "error"-severity entries; see requires_confirmation below).
+        #
+        # The branch catches two failures: a genuinely missing key, and a type the LLM
+        # invented or copied from a UI label ("Repeat times") instead of the internal
+        # type ("repeat"). Naming the offending value tells them apart.
+        if step_type:
+            detail = f"unsupported step type '{step_type}'"
+        else:
+            detail = "a step with no type"
+        logger.warning(
+            "validate_step dropped step %s: %s. Raw step: %s",
+            step_index, detail, json.dumps(step, ensure_ascii=False, default=str),
+        )
+        warnings.append({
+            "severity": "warning",
+            "message": f"Step {step_index}: the assistant proposed {detail} — it was dropped."
+        })
+        return None
+
+    return step_copy
 
 
 def new_message_multimodal(request: HttpRequest) -> HttpResponse:
@@ -1740,66 +1261,225 @@ def new_message_multimodal(request: HttpRequest) -> HttpResponse:
                 data_locations = data.get("dataLocations")
                 data_objects = data.get("dataObjects")
                 data_actions = data.get("dataActions")
+                # Saved Tasks. Without this list the prompt only said the "Saved Tasks"
+                # category exists, and a user asking to reuse one made the model invent
+                # `{"type": "macro_task", "macroName": "dispose"}` with a made-up id.
+                data_macros = data.get("dataMacros") or []
+                data_blocks = data.get("dataBlocks")
+
+                if message is None:
+                    return error_response("Message is required")
 
                 data_result = {}
 
-                prompt_template = CHATGPT_INSTRUCTIONS_MULTIMODAL.format(
-                    objects=data_objects,
-                    locations=data_locations,
-                    actions=data_actions,
-                    task=json.dumps(task_structure),
-                )
+                replacements = {
+                    "{{objects}}": json.dumps(data_objects, ensure_ascii=False),
+                    "{{locations}}": json.dumps(data_locations, ensure_ascii=False),
+                    "{{actions}}": json.dumps(data_actions, ensure_ascii=False),
+                    "{{macros}}": json.dumps(data_macros, ensure_ascii=False),
+                    "{{blocks}}": format_blocks_catalog(data_blocks),
+                    "{{scene}}": json.dumps(_scene_summary(), ensure_ascii=False),
+                }
+                prompt_template = CHATGPT_INSTRUCTIONS_MULTIMODAL
+                for placeholder, value in replacements.items():
+                    prompt_template = prompt_template.replace(placeholder, value)
 
-                # Init the conversation
-                if chat_log is None or len(chat_log) == 0:
-                    chat_log = [
-                        {
-                            "role": "system",
-                            "content": prompt_template,
-                        },
-                    ]
+                prompt_template += f"\n\n# CURRENT TASK SNAPSHOT #\n{json.dumps(task_structure, ensure_ascii=False)}"
 
-                new_message_template = CHATGPT_NEW_MESSAGE_MULTIMODAL.format(
-                    message=message,
-                    task=json.dumps(task_structure),
-                )
+                system_message = {"role": "system", "content": prompt_template}
 
-                chat_log.append({"role": "user", "content": new_message_template})
-                response = client.chat.completions.create(
-                    model=CHATGPT_MODEL,
-                    messages=chat_log,
-                    temperature=CHATGPT_TEMPERATURE,
-                    tools=[CHATGPT_FUNCTION_MULTIMODAL],
-                    tool_choice={
-                        "type": "function",
-                        "function": {
-                            "name": CHATGPT_FUNCTION_MULTIMODAL["function"]["name"],
-                        },
-                    },
-                    parallel_tool_calls=False,
-                )
+                # Client only ever needs to round-trip user/assistant turns — drop
+                # anything else (e.g. an injected system message) and cap history
+                # length before rebuilding the system message fresh every turn.
+                chat_log = [
+                    msg for msg in (chat_log or [])
+                    if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
+                ][-MAX_CHAT_HISTORY:]
+                chat_log.insert(0, system_message)
 
-                response_json = (
-                    response.choices[0].message.tool_calls[0].function.arguments
-                )
+                chat_log.append({"role": "user", "content": message})
+
+                provider = get_llm_provider()
+
+                response_json = {}
+                answer = ""
+                llm_task = []
+
+                for attempt in range(3):
+                    llm_response = provider.complete(
+                        messages=chat_log,
+                        tools=[CHATGPT_FUNCTION_MULTIMODAL],
+                        tool_name=CHATGPT_FUNCTION_MULTIMODAL["function"]["name"],
+                        temperature=CHATGPT_TEMPERATURE
+                    )
+                    response_json = llm_response.raw_arguments
+                    answer = fix_stray_json_escapes(response_json.get("answer", "").strip())
+                    llm_task_raw = response_json.get("task", "[]")
+                    if isinstance(llm_task_raw, str):
+                        try:
+                            llm_task = json.loads(llm_task_raw)
+                        except Exception:
+                            try:
+                                # Some models (observed: gemini-3.5-flash-lite)
+                                # intermittently double-escape quotes inside
+                                # this string (\"type\" instead of "type").
+                                # One extra unescape pass recovers an
+                                # otherwise-valid payload before giving up.
+                                llm_task = json.loads(llm_task_raw.replace('\\"', '"'))
+                            except Exception:
+                                llm_task = []
+                    else:
+                        llm_task = llm_task_raw or []
+
+                    if answer:
+                        break
+
+                    chat_log.append({"role": "system", "content": CHATGPT_ALWAYS_REPLY})
+
+                chat_log = [msg for msg in chat_log if not (msg["role"] == "system" and msg["content"] == CHATGPT_ALWAYS_REPLY)]
+
+                if not answer:
+                    answer = "Okay, let's continue."
+                    response_json["answer"] = answer
 
                 try:
-                    response_json = loads(response_json)
-                    answer = response_json["answer"]
+                    validation_warnings = []
+                    if isinstance(llm_task, list) and len(llm_task) > 0:
+                        llm_task = unwrap_branch_envelopes(llm_task)
+                        llm_task = repair_flattened_steps(llm_task, validation_warnings)
+                    validated_task = []
 
-                    if answer != "":
-                        chat_log.append({"role": "assistant", "content": answer})
+                    for step_index, step in enumerate(llm_task):
+                        validated_step = validate_step(step, step_index, validation_warnings, data_objects, data_locations, data_actions, data_macros)
+                        if validated_step is not None:
+                            validated_task.append(validated_step)
 
-                except Exception:
-                    data_result["answer"] = CHATGPT_ERROR
+                    # Once a step is dropped there is no other record of what
+                    # the LLM actually sent — the frontend only ever sees the
+                    # sanitized warning text. Logged only on an actual drop so
+                    # this stays quiet on healthy turns. Warning level because
+                    # no log handler is configured (settings.LOGGING has no
+                    # 'handlers'), so anything below WARNING never prints.
+                    if len(validated_task) < len(llm_task):
+                        logger.warning(
+                            "Dropped %d of %d proposed steps. Raw LLM task: %s",
+                            len(llm_task) - len(validated_task),
+                            len(llm_task),
+                            json.dumps(llm_task, ensure_ascii=False, default=str),
+                        )
 
-                data_result["chatLog"] = chat_log
-                data_result["response"] = response_json
+                    message_parts = []
+                    if answer:
+                        message_parts.append({"type": "text", "content": answer})
+
+                    # LLM-provided actionable suggestions (shown as chips).
+                    for part in (response_json.get("messageParts") or []):
+                        if isinstance(part, dict) and part.get("type") == "suggestion" and part.get("content"):
+                            message_parts.append({"type": "suggestion", "content": fix_stray_json_escapes(str(part["content"]))})
+
+                    frontend_warnings = [w["message"] for w in validation_warnings]
+                    for warning_msg in frontend_warnings:
+                        message_parts.append({"type": "warning", "content": warning_msg})
+
+                    # Store a compact assistant turn in history — the full "task"
+                    # is dropped since the # CURRENT TASK SNAPSHOT # already carries
+                    # it fresh on every turn; keeping it here would just double the
+                    # tokens spent on it in every subsequent call.
+                    chat_log.append({"role": "assistant", "content": json.dumps({
+                        "answer": answer,
+                        "intent": response_json.get("intent"),
+                        "taskModified": response_json.get("taskModified"),
+                    })})
+
+                    is_valid = not any(w["severity"] == "error" for w in validation_warnings)
+                    task_modified = response_json.get("taskModified", True)
+                    requires_confirmation = task_modified and len(validated_task) > 0 and is_valid
+
+                    # The model said it changed the program, and nothing
+                    # survived validation to show for it. Whatever the cause,
+                    # the user must not be left reading "I updated your task"
+                    # with no proposal under it and a developer-worded warning
+                    # as the only clue — that reads as the app ignoring them.
+                    # Say plainly that it did not go through and that asking
+                    # again usually works, because it does: the failure is in
+                    # the model's output shape, so a fresh attempt often
+                    # produces a well-formed one.
+                    if task_modified and not requires_confirmation:
+                        logger.warning(
+                            "Chat turn claimed a task change but produced nothing "
+                            "applicable (steps=%s, is_valid=%s). Warnings: %s",
+                            len(validated_task), is_valid, validation_warnings,
+                        )
+                        message_parts.append({
+                            "type": "warning",
+                            "content": (
+                                "I could not turn that into blocks, so nothing was "
+                                "changed in your task. Try asking again, or say it "
+                                "in a different way."
+                            ),
+                        })
+
+                    # One record per chat turn. "How many times did the operator
+                    # have to ask before getting a program worth accepting" is a
+                    # headline measure of the conversational interface, and
+                    # counting it off the screen recording means replaying every
+                    # session by hand. `requires_confirmation` is what the user
+                    # actually sees offered, so it is the honest definition of
+                    # "this turn produced something".
+                    study_log.log_event(
+                        "chat_turn",
+                        message=message,
+                        intent=response_json.get("intent"),
+                        task_modified=task_modified,
+                        proposed_steps=len(validated_task),
+                        offered=requires_confirmation,
+                        is_valid=is_valid,
+                        warnings=frontend_warnings,
+                    )
+
+                    data_result = {
+                        "messageParts": message_parts,
+                        "proposedTask": validated_task if requires_confirmation else None,
+                        "requiresConfirmation": requires_confirmation,
+                        "validationWarnings": frontend_warnings,
+                        "isValid": is_valid,
+                        # Drop the system message (full prompt + DB dump) — the
+                        # server rebuilds it every turn, no need to round-trip it.
+                        "chatLog": [m for m in chat_log if m["role"] != "system"],
+                        "intent": response_json.get("intent"),
+                        "response": {
+                            "answer": answer,
+                            "task": validated_task if requires_confirmation else None,
+                            "taskModified": task_modified,
+                            "intent": response_json.get("intent"),
+                            "lang": response_json.get("lang"),
+                            "finished": False,
+                            "validationWarnings": frontend_warnings,
+                        },
+                    }
+
+                except Exception as inner_e:
+                    logger.exception("Inner chat parse error")
+                    data_result = {
+                        "messageParts": [{"type": "text", "content": CHATGPT_ERROR}],
+                        "proposedTask": None,
+                        "requiresConfirmation": False,
+                        "validationWarnings": [str(inner_e)],
+                        "isValid": False,
+                        "chatLog": chat_log,
+                        "response": {
+                            "answer": CHATGPT_ERROR,
+                            "task": None,
+                            "finished": False,
+                            "validationWarnings": [str(inner_e)],
+                        },
+                    }
+
                 return success_response(data_result)
             else:
                 return invalid_request_method()
         else:
             return unauthorized_request()
     except Exception as e:
-        print(e)
-        return error_response(CHATGPT_ERROR)
+        logger.exception("Exception in new_message_multimodal")
+        return error_response(f"Server error: {str(e)}")

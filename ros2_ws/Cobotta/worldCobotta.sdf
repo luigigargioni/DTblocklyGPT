@@ -1,34 +1,36 @@
 <?xml version="1.0" ?>
 <sdf version="1.11">
   <world name="worldCobotta">
-    <!-- <scene>
+    <scene>
       <grid>false</grid>
     </scene>
     <gravity>0 0 -9.81</gravity>
-    <!-- Configurazione fisica ottimizzata per pick and place -->
     <physics name="1ms" type="ode">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
       <real_time_update_rate>1000</real_time_update_rate>
-      <max_contacts>20</max_contacts>
+      <max_contacts>12</max_contacts>
       <ode>
         <solver>
-          <type>quick</type>
-          <iters>50</iters>
+          <type>world</type>
+          <iters>100</iters>
           <sor>1.3</sor>
           <use_dynamic_moi_rescaling>true</use_dynamic_moi_rescaling>
         </solver>
         <constraints>
-          <cfm>0.0</cfm>
+          <cfm>1e-10</cfm>
           <erp>0.2</erp>
-          <contact_max_correcting_vel>100.0</contact_max_correcting_vel>
-          <contact_surface_layer>0.001</contact_surface_layer>
+          <contact_max_correcting_vel>10.0</contact_max_correcting_vel>
+          <contact_surface_layer>0.0001</contact_surface_layer>
         </constraints>
       </ode>
     </physics>
     <plugin
       filename="gz-sim-physics-system"
       name="gz::sim::systems::Physics">
+      <engine>
+        <filename>gz-physics-dartsim-plugin</filename>
+      </engine>
     </plugin>
     <plugin
       filename="gz-sim-sensors-system"
@@ -51,13 +53,13 @@
           <property type="bool" key="showTitleBar">false</property>
           <property type="string" key="state">docked</property>
         </gz-gui>
-        <engine>ogre2</engine>
+        <engine>ogre</engine>
         <scene>scene</scene>
        
         <camera_pose>-9.5 -2 1.5 0 0 1</camera_pose>
         <camera_clip>
           <near>0.25</near>
-          <far>25000</far>
+          <far>2000</far>
         </camera_clip>
       </plugin>
 
@@ -180,33 +182,6 @@
     </light>
 
 
-    <!-- * testing objects for pick and place tasks -->
-    <!-- <include>
-      <name>flaskholder1</name>
-      <static>false</static>
-      <pose>-9.05 -1.48 1.065 0 0 0</pose>
-      <uri>
-        model://locations/collector/model.sdf
-      </uri>
-    </include>
-
-    <include>
-      <name>flaskholder2</name>
-      <static>false</static>
-      <pose>-8.8 -1.41 1.065 0 0 0</pose>
-      <uri>
-        model://locations/collector/model.sdf
-      </uri>
-    </include>
-
-    <include>
-      <name>flask</name>
-      <static>false</static>
-      <pose>-9.05 -1.48 1.065 0 0 0</pose>
-      <uri>
-        model://objects/flask/model.sdf
-      </uri>
-    </include> -->
 
     <include>
       <name>Cobotta</name>
@@ -216,13 +191,181 @@
       </uri>
     </include>
     
+    <!-- Pick-side tube rack. Same model file the place side spawns
+         (locations/tube_rack) — the two racks are one physical object in the
+         real cell, so they must not become two geometries here.
+
+         Included statically instead of spawned per run: the pick rack never
+         changes, and every create/remove cycle is a chance to hit the
+         "physics entity ptr ... does not exist" errors the object spawns
+         already produce.
+
+         Pose = the pick point itself, because the model's origin is the
+         centre of slot 0: x = ROBOT_BASE_X + DEFAULT_PICK_X_REL = -9.0 + -0.05,
+         y = ROBOT_BASE_Y + DEFAULT_PICK_Y_REL = -1.2 + -0.28,
+         z = TABLE_TOP_Z_ABS. No rotation, so model-X runs along robot X and
+         slot i lands on PICK_RACK_PROFILE's slot_xy_offsets[i] (calibration.py).
+         Keep this pose in sync with those constants. -->
     <include>
-      <name>Table</name>
-      <pose>-9.0 -2.4 0 0 0 1.57</pose>
+      <name>PickTubeRack</name>
+      <static>true</static>
+      <pose>-9.05 -1.48 1.0134 0 0 0</pose>
       <uri>
-        model://ReflectiveTable/model.sdf
+        model://locations/tube_rack/model.sdf
       </uri>
     </include>
+
+    <model name="SimpleTable">
+      <static>true</static>
+      <!-- Top = ROBOT_BASE_Z + PICK_Z_REF_OFFSET (calibration.py) = 1.05 - 0.0366 = 1.0134.
+           Keep this pose and PICK_Z_REF_OFFSET in sync — see the import-time assert
+           in calibration.py that catches drift between them. -->
+      <pose>-9.0 -1.2 0.4934 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>1.5 1.5 1.04</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>1.5 1.5 1.04</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+            <specular>0.0 0.0 0.0 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Cobotta Base Plate Set (DENSO official accessory) — the real cell mounts
+         the robot on this stand, 36.6mm between the table top and the robot's
+         foot (base.dae origin sits at the foot). Without it the twin would show
+         the robot floating above the table now that SimpleTable moved down to
+         match the measured real-cell geometry. Two-plate approximation with
+         primitives (no mesh download) — refine footprint/finish with calipers
+         at the next physical session. -->
+    <model name="RobotBasePlate">
+      <static>true</static>
+      <pose>-9.0 -1.2 0 0 0 0</pose>
+      <link name="plate">
+        <visual name="lower_star_a">
+          <pose>0 0 1.020 0 0 0.7854</pose>
+          <geometry>
+            <box><size>0.30 0.085 0.012</size></box>
+          </geometry>
+          <material>
+            <ambient>0.25 0.25 0.28 1</ambient>
+            <diffuse>0.4 0.4 0.45 1</diffuse>
+            <specular>0.6 0.6 0.6 1</specular>
+          </material>
+        </visual>
+        <visual name="lower_star_b">
+          <pose>0 0 1.020 0 0 -0.7854</pose>
+          <geometry>
+            <box><size>0.30 0.085 0.012</size></box>
+          </geometry>
+          <material>
+            <ambient>0.25 0.25 0.28 1</ambient>
+            <diffuse>0.4 0.4 0.45 1</diffuse>
+            <specular>0.6 0.6 0.6 1</specular>
+          </material>
+        </visual>
+        <visual name="upper_plate">
+          <pose>0 0 1.042 0 0 0</pose>
+          <geometry>
+            <box><size>0.14 0.14 0.014</size></box>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.33 1</ambient>
+            <diffuse>0.45 0.45 0.5 1</diffuse>
+            <specular>0.7 0.7 0.7 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <pose>0 0 1.026 0 0 0</pose>
+          <geometry>
+            <box><size>0.16 0.16 0.036</size></box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <model name="overhead_camera">
+      <static>true</static>
+      <!-- Side view of the Cobotta arm, framed on the work area rather than on
+           the room. Moved in from 1.29 m to 0.84 m of slant range on 2026-09-17
+           after watching participants lean toward the screen to see the twin:
+           the arm was ~29% of the frame height and is now ~45%, a 1.53x
+           magnification.
+
+           The distance is not a taste value. It is the closest the camera can
+           sit while still holding everything the operator has to see, with
+           margin, at this 60-degree horizontal FOV and 4:3 frame:
+
+             pick point (tube rack)   x -9.05      frame covers -9.41 .. -8.44
+             place point (cup)        x -8.80
+             table top                z 1.0134     frame covers  0.87 ..  1.60
+             arm at rest              z ~1.45
+             gripper at CARRY_Z_MAX   z  1.28      (1.05 base + 0.23)
+
+           Pitch and yaw are derived, not chosen: they aim the axis at the
+           centre of that box, (-8.925, -1.34, 1.23). The old yaw left the work
+           area right-of-centre with empty floor on the left, which is frame
+           spent on nothing.
+
+           Resolution and rate are untouched: 640x480 is what the vision
+           pipeline needs (see the sensor's own note) and 5 Hz is the
+           simulation's speed budget. Moving the camera only makes the objects
+           larger in those same pixels, which detection prefers. -->
+      <pose>-9.0 -2.15 1.45 0 0.262 1.4785</pose>
+      <link name="camera_link">
+        <sensor name="overhead_cam" type="camera">
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>100</far>
+            </clip>
+          </camera>
+          <always_on>true</always_on>
+          <!-- 5, not 15. Measured on the dev VM (no GPU, llvmpipe software
+               rasterisation) 2026-09-03: this one number is the simulation's
+               whole speed budget.
+
+                 camera 15Hz .......... RTF 0.398
+                 camera  5Hz .......... RTF 0.954
+                 no camera at all ..... RTF 1.000
+
+               Everything else that looked expensive is not. The ODE solver
+               (`world`, the exact LCP one) and a 1ms step were both measured
+               against their cheaper alternatives — quickstep, and a 2ms step —
+               and each bought under 5%, well inside the noise of what the
+               camera decides. So the solver and the step stay as they were
+               rather than trading contact accuracy for nothing: this cell
+               places 18mm tubes into 2mm-walled containers, and the
+               calibration is tuned against this physics.
+
+               Resolution stays 640x480 on purpose. The frames feed YOLO and
+               the cap-colour classifier as well as the operator's live view,
+               and dropping pixels would change what the vision pipeline can
+               see. Dropping the RATE does not. -->
+          <update_rate>5</update_rate>
+          <topic>/gz/camera/image</topic>
+          <visualize>false</visualize>
+        </sensor>
+      </link>
+    </model>
 
   </world>
 </sdf>
